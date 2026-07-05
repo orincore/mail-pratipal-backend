@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@aws-sdk/client-ses": "^3.1079.0",
+    "@aws-sdk/client-sesv2": "^3.1079.0",
     "@types/nodemailer": "^8.0.1",
     "bcryptjs": "^2.4.3",
     "cookie-parser": "^1.4.6",

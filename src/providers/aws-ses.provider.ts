@@ -1,12 +1,10 @@
 import { 
-  SESClient, 
+  SESv2Client, 
   SendEmailCommand, 
-  VerifyDomainIdentityCommand, 
-  VerifyEmailIdentityCommand, 
-  GetIdentityVerificationAttributesCommand, 
-  GetIdentityDkimAttributesCommand,
-  DeleteIdentityCommand
-} from "@aws-sdk/client-ses";
+  CreateEmailIdentityCommand, 
+  GetEmailIdentityCommand, 
+  DeleteEmailIdentityCommand 
+} from "@aws-sdk/client-sesv2";
 import { 
   EmailProvider, 
   SendEmailParams, 
@@ -15,14 +13,14 @@ import {
 } from "./email-provider.interface";
 
 export class AWSEmailProvider implements EmailProvider {
-  private client: SESClient;
+  private client: SESv2Client;
 
   constructor() {
     const accessKeyId = process.env.AWS_ACCESS_KEY_ID || process.env.SES_ACCESS_KEY_ID;
     const secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY || process.env.SES_SECRET_ACCESS_KEY;
-    const region = process.env.AWS_REGION || process.env.SES_REGION || "us-east-1";
+    const region = process.env.AWS_REGION || process.env.SES_REGION || "ap-south-1";
 
-    this.client = new SESClient({
+    this.client = new SESv2Client({
       region,
       credentials: accessKeyId && secretAccessKey ? {
         accessKeyId,
@@ -36,20 +34,23 @@ export class AWSEmailProvider implements EmailProvider {
       ? `"${params.fromName}" <${params.fromEmail}>` 
       : params.fromEmail;
 
+    // Matches the AWS SES v2 send payload exactly 1-to-1
     const command = new SendEmailCommand({
-      Source: source,
+      FromEmailAddress: source,
       Destination: {
         ToAddresses: [params.to],
       },
-      Message: {
-        Subject: {
-          Data: params.subject,
-          Charset: "UTF-8",
-        },
-        Body: {
-          Html: {
-            Data: params.html,
+      Content: {
+        Simple: {
+          Subject: {
+            Data: params.subject,
             Charset: "UTF-8",
+          },
+          Body: {
+            Html: {
+              Data: params.html,
+              Charset: "UTF-8",
+            },
           },
         },
       },
@@ -66,77 +67,62 @@ export class AWSEmailProvider implements EmailProvider {
   }
 
   async verifyDomain(domain: string): Promise<VerifyDomainResult> {
-    // 1. Verify domain identity (generates verification TXT token)
-    const verifyCommand = new VerifyDomainIdentityCommand({ Domain: domain });
-    const verifyResponse = await this.client.send(verifyCommand);
-    const verificationToken = verifyResponse.VerificationToken || "";
-
-    // 2. Fetch DKIM tokens (SES handles Easy DKIM automatic signing)
-    // In SDK v3, we need to request Easy DKIM setup
-    // Since AWS SES automatically generates DKIM tokens on domain creation or using a separate call, 
-    // let's fetch verification DKIM attributes.
-    const dkimCommand = new GetIdentityDkimAttributesCommand({ Identities: [domain] });
-    const dkimResponse = await this.client.send(dkimCommand);
-    const dkimTokens = dkimResponse.DkimAttributes?.[domain]?.DkimTokens || [];
+    const command = new CreateEmailIdentityCommand({ EmailIdentity: domain });
+    const response = await this.client.send(command);
+    const dkimTokens = response.DkimAttributes?.Tokens || [];
 
     return {
-      verificationToken,
+      verificationToken: dkimTokens[0] || "",
       dkimTokens,
     };
   }
 
   async getDomainVerificationStatus(domain: string): Promise<DomainStatusResult> {
-    const verifyCommand = new GetIdentityVerificationAttributesCommand({ Identities: [domain] });
-    const verifyResponse = await this.client.send(verifyCommand);
-    const rawVerifyStatus = verifyResponse.VerificationAttributes?.[domain]?.VerificationStatus;
+    try {
+      const command = new GetEmailIdentityCommand({ EmailIdentity: domain });
+      const response = await this.client.send(command);
+      
+      const verified = response.Verified;
+      const dkimStatus = response.DkimAttributes?.Status;
 
-    const dkimCommand = new GetIdentityDkimAttributesCommand({ Identities: [domain] });
-    const dkimResponse = await this.client.send(dkimCommand);
-    const rawDkimStatus = dkimResponse.DkimAttributes?.[domain]?.DkimVerificationStatus;
+      const mapStatus = (isVerified: boolean, status?: string): "Pending" | "Success" | "Failed" | "NotFound" => {
+        if (isVerified && status === "SUCCESS") return "Success";
+        if (status === "FAILED") return "Failed";
+        return "Pending";
+      };
 
-    const mapStatus = (status?: string): "Pending" | "Success" | "Failed" | "NotFound" => {
-      switch (status) {
-        case "Pending":
-          return "Pending";
-        case "Success":
-          return "Success";
-        case "Failed":
-          return "Failed";
-        default:
-          return "NotFound";
+      return {
+        verificationStatus: mapStatus(!!verified, dkimStatus),
+        dkimStatus: dkimStatus === "SUCCESS" ? "Success" : dkimStatus === "FAILED" ? "Failed" : "Pending",
+      };
+    } catch (error: any) {
+      if (error.name === "NotFoundException") {
+        return { verificationStatus: "NotFound", dkimStatus: "NotFound" };
       }
-    };
-
-    return {
-      verificationStatus: mapStatus(rawVerifyStatus),
-      dkimStatus: mapStatus(rawDkimStatus),
-    };
+      throw error;
+    }
   }
 
   async verifyEmailIdentity(email: string): Promise<void> {
-    const command = new VerifyEmailIdentityCommand({ EmailAddress: email });
+    const command = new CreateEmailIdentityCommand({ EmailIdentity: email });
     await this.client.send(command);
   }
 
   async getEmailIdentityVerificationStatus(email: string): Promise<"Pending" | "Success" | "Failed" | "NotFound"> {
-    const command = new GetIdentityVerificationAttributesCommand({ Identities: [email] });
-    const response = await this.client.send(command);
-    const rawStatus = response.VerificationAttributes?.[email]?.VerificationStatus;
-
-    switch (rawStatus) {
-      case "Pending":
-        return "Pending";
-      case "Success":
-        return "Success";
-      case "Failed":
-        return "Failed";
-      default:
+    try {
+      const command = new GetEmailIdentityCommand({ EmailIdentity: email });
+      const response = await this.client.send(command);
+      return response.Verified ? "Success" : "Pending";
+    } catch (error: any) {
+      if (error.name === "NotFoundException") {
         return "NotFound";
+      }
+      throw error;
     }
   }
 
   async deleteIdentity(identity: string): Promise<void> {
-    const command = new DeleteIdentityCommand({ Identity: identity });
+    const command = new DeleteEmailIdentityCommand({ EmailIdentity: identity });
     await this.client.send(command);
   }
 }

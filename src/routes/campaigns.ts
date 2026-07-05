@@ -1,7 +1,10 @@
 import { Router, Response } from "express";
+import mongoose from "mongoose";
 import { AuthenticatedRequest, authMiddleware } from "../middleware/auth";
 import EmailCampaign from "../models/EmailCampaign";
+import { getEmailProvider } from "../providers/provider-factory";
 import "../models/EmailTemplate"; // Ensure template model is registered for populate
+import { prepareEmailHtml } from "../lib/tracking-parser";
 
 const router = Router();
 
@@ -137,6 +140,114 @@ router.delete("/", async (req: AuthenticatedRequest, res: Response) => {
     return res.json({ success: true, message: "Campaign deleted successfully" });
   } catch (error: any) {
     console.error("DELETE campaign error:", error);
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/campaigns/:id/test-send - Send test email for a campaign
+router.post("/:id/test-send", async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { id } = req.params;
+    const { to } = req.body;
+
+    if (!to) {
+      return res.status(400).json({ error: "Recipient email 'to' is required" });
+    }
+
+    const campaign = await EmailCampaign.findById(id);
+    if (!campaign) {
+      return res.status(404).json({ error: "Campaign not found" });
+    }
+
+    // Load template
+    const EmailTemplate = mongoose.model("EmailTemplate");
+    const template = await EmailTemplate.findById(campaign.template_id);
+    if (!template) {
+      return res.status(404).json({ error: "Template not found for this campaign" });
+    }
+
+    const provider = getEmailProvider();
+    
+    // We can send the template's html
+    let finalHtml = template.html_content || "";
+    if (template.type === "text") {
+      finalHtml = `
+        <div style="font-family: sans-serif; font-size: 15px; color: #1e293b; white-space: pre-wrap; line-height: 1.6;">
+          ${finalHtml}
+        </div>
+      `;
+    }
+
+    // Parse HTML to inject personalization mock values and the unsubscribe link (tracking disabled)
+    const trackingUrl = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3001";
+    const parsedHtml = prepareEmailHtml({
+      html: finalHtml,
+      subscriber: {
+        email: to,
+        first_name: "Test",
+        last_name: "Recipient",
+        status: "subscribed",
+      } as any,
+      campaignId: campaign._id.toString(),
+      trackingUrl,
+      trackingEnabled: { opens: false, clicks: false },
+    });
+
+    console.log(`Campaign Test Send: Dispatching test email for campaign ${campaign.name} to ${to}`);
+
+    const result = await provider.sendEmail({
+      to,
+      fromName: campaign.sender_name,
+      fromEmail: campaign.sender_email,
+      subject: `[TEST] ${campaign.subject}`,
+      html: parsedHtml,
+      replyTo: campaign.reply_to,
+    });
+
+    return res.json({
+      success: true,
+      messageId: result.messageId,
+      dispatched_at: new Date().toISOString(),
+    });
+  } catch (error: any) {
+    console.error("Campaign test send error:", error);
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/campaigns/:id/rerun - Duplicate and reschedule an existing campaign
+router.post("/:id/rerun", async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { id } = req.params;
+    const { schedule_type, scheduled_at } = req.body;
+
+    const campaign = await EmailCampaign.findById(id);
+    if (!campaign) {
+      return res.status(404).json({ error: "Campaign not found" });
+    }
+
+    const scheduledDate = schedule_type === "scheduled" && scheduled_at 
+      ? new Date(scheduled_at) 
+      : new Date();
+
+    // Create a duplicated campaign
+    const newCampaign = await EmailCampaign.create({
+      name: `${campaign.name} (Rerun)`,
+      subject: campaign.subject,
+      sender_name: campaign.sender_name,
+      sender_email: campaign.sender_email,
+      reply_to: campaign.reply_to,
+      template_id: campaign.template_id,
+      audience: campaign.audience,
+      schedule_type,
+      scheduled_at: scheduledDate,
+      status: schedule_type === "immediate" ? "sending" : "scheduled",
+      stats: { sent: 0, delivered: 0, opens: 0, clicks: 0, bounces: 0, complaints: 0, unsubscribed: 0 }
+    });
+
+    return res.json({ success: true, campaign: newCampaign });
+  } catch (error: any) {
+    console.error("Rerun campaign error:", error);
     return res.status(500).json({ error: error.message });
   }
 });

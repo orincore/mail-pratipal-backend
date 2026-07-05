@@ -75,20 +75,19 @@ export function prepareEmailHtml({
 
   if (parsedHtml.includes("{{unsubscribe}}")) {
     parsedHtml = parsedHtml.replaceAll("{{unsubscribe}}", unsubscribeUrl);
+  }
+
+  // Always append a standardized unsubscribe footer at the bottom of the email content
+  const unsubscribeFooter = `
+    <div style="margin-top: 30px; border-top: 1px solid #e2e8f0; padding-top: 20px; text-align: center; font-size: 12px; color: #64748b; font-family: sans-serif; line-height: 1.5;">
+      To unsubscribe from these emails, please <a href="${unsubscribeUrl}" style="color: #059669; text-decoration: underline; font-weight: 500;">click here</a>.
+    </div>
+  `;
+
+  if (parsedHtml.includes("</body>")) {
+    parsedHtml = parsedHtml.replace("</body>", `${unsubscribeFooter}</body>`);
   } else {
-    // Append a footer with unsubscribe if not found
-    const unsubscribeFooter = `
-      <div style="margin-top: 30px; border-top: 1px solid #e5e7eb; padding-top: 15px; text-align: center; font-size: 12px; color: #9ca3af; font-family: sans-serif;">
-        You are receiving this email because you subscribed to Pratipal communications. <br/>
-        <a href="${unsubscribeUrl}" style="color: #059669; text-decoration: underline;">Unsubscribe from this list</a>
-      </div>
-    `;
-    
-    if (parsedHtml.includes("</body>")) {
-      parsedHtml = parsedHtml.replace("</body>", `${unsubscribeFooter}</body>`);
-    } else {
-      parsedHtml += unsubscribeFooter;
-    }
+    parsedHtml += unsubscribeFooter;
   }
 
   // 4. Open Tracking Pixel Injection (1x1 transparent image)

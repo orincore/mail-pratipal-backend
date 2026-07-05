@@ -1,6 +1,7 @@
 import { Router, Response } from "express";
 import { AuthenticatedRequest, authMiddleware } from "../middleware/auth";
 import { getEmailProvider } from "../providers/provider-factory";
+import { prepareEmailHtml } from "../lib/tracking-parser";
 
 const router = Router();
 
@@ -10,7 +11,7 @@ router.use(authMiddleware);
 // POST /api/test-send - Dispatch test email
 router.post("/", async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const { to, subject, html, fromName = "Pratipal Test", fromEmail = "support@notifications.pratipal.in" } = req.body;
+    const { to, subject, html, fromName = "Pratipal", fromEmail = "contact@notifications.pratipal.in" } = req.body;
 
     if (!to || !subject || !html) {
       return res.status(400).json({ error: "Required fields (to, subject, html) are missing" });
@@ -18,6 +19,21 @@ router.post("/", async (req: AuthenticatedRequest, res: Response) => {
 
     const provider = getEmailProvider();
     
+    // Parse HTML to inject personalization mock values and the unsubscribe link (tracking disabled)
+    const trackingUrl = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3001";
+    const parsedHtml = prepareEmailHtml({
+      html,
+      subscriber: {
+        email: to,
+        first_name: "Test",
+        last_name: "Recipient",
+        status: "subscribed",
+      } as any,
+      campaignId: "test-campaign",
+      trackingUrl,
+      trackingEnabled: { opens: false, clicks: false },
+    });
+
     console.log(`Test Send: Dispatching test email to ${to} via ${process.env.EMAIL_PROVIDER || "auto-detected driver"}`);
     
     const result = await provider.sendEmail({
@@ -25,7 +41,7 @@ router.post("/", async (req: AuthenticatedRequest, res: Response) => {
       fromName,
       fromEmail,
       subject,
-      html,
+      html: parsedHtml,
     });
 
     return res.json({

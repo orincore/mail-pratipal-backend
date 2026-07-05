@@ -142,6 +142,16 @@ router.get("/senders", async (req: AuthenticatedRequest, res: Response) => {
     // Sync validation state with AWS SES in real time
     for (const s of senders) {
       try {
+        // If the email belongs to the verified subdomain, bypass SES check and force verified status
+        if (s.email.toLowerCase().endsWith("@notifications.pratipal.in")) {
+          if (s.verification_status !== "verified") {
+            s.verification_status = "verified";
+            await s.save();
+          }
+          updatedSenders.push(s);
+          continue;
+        }
+
         const rawStatus = await provider.getEmailIdentityVerificationStatus(s.email);
         const lowerStatus = rawStatus.toLowerCase();
         s.verification_status = (
@@ -181,14 +191,20 @@ router.post("/senders", async (req: AuthenticatedRequest, res: Response) => {
       return res.status(400).json({ error: "Email identity is already registered" });
     }
 
-    const provider = getEmailProvider();
-    
-    // Request AWS SES verification email to be sent
-    await provider.verifyEmailIdentity(cleanEmail);
+    const isSubdomainSender = cleanEmail.endsWith("@notifications.pratipal.in");
+    let verification_status = "pending";
+
+    if (isSubdomainSender) {
+      verification_status = "verified";
+    } else {
+      const provider = getEmailProvider();
+      // Request AWS SES verification email to be sent
+      await provider.verifyEmailIdentity(cleanEmail);
+    }
 
     const emailSender = await EmailSender.create({
       email: cleanEmail,
-      verification_status: "pending",
+      verification_status,
     });
 
     return res.json({ success: true, sender: emailSender });
@@ -213,9 +229,12 @@ router.delete("/senders", async (req: AuthenticatedRequest, res: Response) => {
     }
 
     const provider = getEmailProvider();
-    
-    // Try to remove from SES identity list
-    if (typeof (provider as any).deleteIdentity === "function") {
+
+    // Try to remove from SES identity list only if it's not our verified subdomain
+    if (
+      !emailSender.email.toLowerCase().endsWith("@notifications.pratipal.in") &&
+      typeof (provider as any).deleteIdentity === "function"
+    ) {
       try {
         await (provider as any).deleteIdentity(emailSender.email);
       } catch (err) {

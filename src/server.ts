@@ -13,6 +13,9 @@ import testSendRouter from "./routes/test-send";
 import trackingRouter from "./routes/tracking";
 import unsubscribeRouter from "./routes/unsubscribe";
 import jobsRouter from "./routes/jobs";
+import landingPagesRouter from "./routes/landing-pages";
+import dashboardRouter from "./routes/dashboard";
+import webhooksRouter from "./routes/webhooks";
 
 const app = express();
 
@@ -49,14 +52,17 @@ app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 app.use(cookieParser());
 
 // 3. Mount API Endpoints (matching Next.js patterns exactly)
+app.use("/api/track", trackingRouter); // mounts /open and /click -> /api/track/open & /api/track/click
+app.use("/api/unsubscribe", unsubscribeRouter);
+app.use("/api/webhooks", webhooksRouter); // mounts /aws-ses -> /api/webhooks/aws-ses
 app.use("/api/campaigns", campaignsRouter);
 app.use("/api/templates", templatesRouter);
 app.use("/api/subscribers", subscribersRouter);
-app.use("/api", settingsRouter); // mounts /domains and /senders -> /api/domains & /api/senders
 app.use("/api/test-send", testSendRouter);
-app.use("/api/track", trackingRouter); // mounts /open and /click -> /api/track/open & /api/track/click
-app.use("/api/unsubscribe", unsubscribeRouter);
 app.use("/api/jobs", jobsRouter);
+app.use("/api/landing-pages", landingPagesRouter);
+app.use("/api", settingsRouter); // mounts /domains and /senders -> /api/domains & /api/senders
+app.use("/api", dashboardRouter);
 
 // Standard Health Check
 app.get("/health", (req, res) => {

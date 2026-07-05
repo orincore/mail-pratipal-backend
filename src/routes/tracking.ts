@@ -41,6 +41,7 @@ router.get("/open", async (req: Request, res: Response) => {
   try {
     const campaignId = req.query.campaignId as string;
     const email = req.query.email as string;
+    console.log(`[Tracking] Open request received: campaignId=${campaignId}, email=${email}`);
 
     if (campaignId && email) {
       const ipAddress = (req.headers["x-forwarded-for"] as string) || req.ip || "unknown";
@@ -95,6 +96,7 @@ router.get("/click", async (req: Request, res: Response) => {
 
   const fallbackUrl = "https://pratipal.in";
   const destinationUrl = url ? decodeURIComponent(url) : fallbackUrl;
+  console.log(`[Tracking] Click request received: campaignId=${campaignId}, email=${email}, url=${destinationUrl}`);
 
   try {
     if (campaignId && email) {
