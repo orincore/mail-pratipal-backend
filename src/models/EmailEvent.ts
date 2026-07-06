@@ -3,6 +3,7 @@ import mongoose, { Schema, Document } from "mongoose";
 export interface IEmailEvent extends Document {
   campaign_id?: mongoose.Types.ObjectId;
   automation_id?: mongoose.Types.ObjectId;
+  reminder_id?: mongoose.Types.ObjectId;
   recipient_email: string;
   event_type: "sent" | "delivered" | "open" | "click" | "bounce" | "complaint" | "unsubscribe";
   timestamp: Date;
@@ -18,6 +19,7 @@ const EmailEventSchema = new Schema<IEmailEvent>(
   {
     campaign_id: { type: Schema.Types.ObjectId, ref: "EmailCampaign", index: true },
     automation_id: { type: Schema.Types.ObjectId, ref: "EmailAutomation", index: true },
+    reminder_id: { type: Schema.Types.ObjectId, ref: "WebinarReminder", index: true },
     recipient_email: { type: String, required: true, index: true },
     event_type: { 
       type: String, 
@@ -47,6 +49,7 @@ const EmailEventSchema = new Schema<IEmailEvent>(
 
 // High-utility composite indexes for analytics reporting
 EmailEventSchema.index({ campaign_id: 1, event_type: 1 });
+EmailEventSchema.index({ reminder_id: 1, event_type: 1 });
 EmailEventSchema.index({ timestamp: -1 });
 
 export default mongoose.models.EmailEvent || mongoose.model<IEmailEvent>("EmailEvent", EmailEventSchema);

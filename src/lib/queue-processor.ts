@@ -3,21 +3,26 @@ import EmailCampaign from "../models/EmailCampaign";
 import EmailTemplate from "../models/EmailTemplate";
 import EmailAutomation from "../models/EmailAutomation";
 import EmailEvent from "../models/EmailEvent";
+import Webinar from "../models/Webinar";
+import WebinarReminder from "../models/WebinarReminder";
 import { getEmailProvider } from "../providers/provider-factory";
 import { prepareEmailHtml } from "./tracking-parser";
+import { syncWebinarsFromWebsite, syncRegistrantsForWebinar, webinarTag } from "./webinar-sync";
 
 /**
  * Executes a full queue processing sweep.
  */
 export async function runQueueSweep(trackingUrl: string) {
   const provider = getEmailProvider();
-  
+
   const campaignResults = await processCampaigns(provider, trackingUrl);
   const automationResults = await processAutomations(provider, trackingUrl);
+  const webinarReminderResults = await processWebinarReminders(provider, trackingUrl);
 
   return {
     campaigns: campaignResults,
-    automations: automationResults
+    automations: automationResults,
+    webinarReminders: webinarReminderResults
   };
 }
 
@@ -333,6 +338,155 @@ async function processAutomations(provider: any, trackingUrl: string) {
       automationId: automation._id,
       name: automation.name,
       processedEnrollments: processedCount,
+    });
+  }
+
+  return summary;
+}
+
+/**
+ * Handles dispatch of due webinar reminder emails.
+ */
+async function processWebinarReminders(provider: any, trackingUrl: string) {
+  await syncWebinarsFromWebsite();
+
+  const dueReminders = await WebinarReminder.find({
+    status: "active",
+    dispatch_status: { $in: ["pending", "sending"] }, // "sending" = resuming a partially-sent batch
+    computed_send_at: { $lte: new Date() },
+  }).populate("webinar_id");
+
+  const summary = [];
+
+  for (const reminder of dueReminders) {
+    const webinar: any = reminder.webinar_id;
+    if (!webinar) continue;
+
+    if (webinar.status === "cancelled") {
+      reminder.dispatch_status = "skipped";
+      await reminder.save();
+      summary.push({ reminderId: reminder._id, status: "skipped", reason: "Webinar cancelled" });
+      continue;
+    }
+
+    if (webinar.status !== "upcoming") {
+      continue;
+    }
+
+    let claimed = reminder;
+    if (reminder.dispatch_status === "pending") {
+      // Atomically claim this reminder so a concurrent sweep (worker + /api/jobs/process
+      // cron) can't both start dispatching the same first batch.
+      const result = await WebinarReminder.findOneAndUpdate(
+        { _id: reminder._id, dispatch_status: "pending" },
+        { $set: { dispatch_status: "sending" } },
+        { new: true }
+      );
+      if (!result) continue;
+      claimed = result;
+    }
+
+    const template = await EmailTemplate.findById(reminder.template_id);
+    if (!template) {
+      claimed.dispatch_status = "skipped";
+      await claimed.save();
+      summary.push({ reminderId: reminder._id, status: "failed", error: "Template not found" });
+      continue;
+    }
+
+    await syncRegistrantsForWebinar(webinar);
+
+    const tag = webinarTag(webinar);
+    const subscribers = await EmailSubscriber.find({ status: "subscribed", tags: tag });
+
+    const sentEmails = await EmailEvent.find({
+      reminder_id: claimed._id,
+      event_type: "sent",
+    }).distinct("recipient_email");
+    const sentEmailsSet = new Set(sentEmails.map((e) => e.toLowerCase()));
+
+    const pendingSubscribers = subscribers.filter(
+      (sub) => !sentEmailsSet.has(sub.email.toLowerCase())
+    );
+
+    if (pendingSubscribers.length === 0) {
+      claimed.dispatch_status = "sent";
+      await claimed.save();
+      summary.push({ reminderId: claimed._id, status: "sent", message: "Empty audience" });
+      continue;
+    }
+
+    const BATCH_LIMIT = 50;
+    const batch = pendingSubscribers.slice(0, BATCH_LIMIT);
+
+    let sentInBatch = 0;
+    let failedInBatch = 0;
+
+    for (const sub of batch) {
+      try {
+        const customizedHtml = prepareEmailHtml({
+          html: template.html_content || "",
+          subscriber: sub,
+          campaignId: claimed._id.toString(),
+          trackingUrl,
+          trackingEnabled: { opens: true, clicks: true },
+        });
+
+        let finalHtml = customizedHtml;
+        if (template.type === "text") {
+          finalHtml = `
+            <div style="font-family: sans-serif; font-size: 15px; color: #1e293b; white-space: pre-wrap; line-height: 1.6;">
+              ${customizedHtml}
+            </div>
+          `;
+        }
+
+        const { messageId } = await provider.sendEmail({
+          to: sub.email,
+          fromName: claimed.sender_name,
+          fromEmail: claimed.sender_email,
+          subject: claimed.subject,
+          html: finalHtml,
+        });
+
+        await EmailEvent.create({
+          reminder_id: claimed._id,
+          recipient_email: sub.email.toLowerCase(),
+          event_type: "sent",
+          timestamp: new Date(),
+          details: { messageId },
+        });
+
+        sentInBatch++;
+      } catch (err: any) {
+        console.error(`Failed to send webinar reminder to ${sub.email}:`, err);
+        await EmailEvent.create({
+          reminder_id: claimed._id,
+          recipient_email: sub.email.toLowerCase(),
+          event_type: "bounce",
+          timestamp: new Date(),
+          details: { error: err.message },
+        });
+        failedInBatch++;
+      }
+    }
+
+    claimed.stats.sent += sentInBatch;
+    claimed.stats.bounces += failedInBatch;
+
+    if (pendingSubscribers.length <= BATCH_LIMIT) {
+      claimed.dispatch_status = "sent";
+    } else {
+      claimed.dispatch_status = "sending"; // resumed on the next sweep
+    }
+
+    await claimed.save();
+    summary.push({
+      reminderId: claimed._id,
+      status: claimed.dispatch_status,
+      sentCount: sentInBatch,
+      failedCount: failedInBatch,
+      remaining: Math.max(0, pendingSubscribers.length - BATCH_LIMIT),
     });
   }
 

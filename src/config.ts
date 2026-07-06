@@ -6,6 +6,10 @@ export const config = {
   mongodbUri: process.env.MONGODB_URI || "",
   jwtSecret: process.env.AUTH_JWT_SECRET || process.env.JWT_SECRET || "fallback-dev-secret",
   apiKey: process.env.API_KEY || "pratipal-api-key-2026-secure-dev-auth",
+  mainWebsite: {
+    url: process.env.MAIN_WEBSITE_URL || "http://localhost:3000",
+    apiKey: process.env.MAIN_WEBSITE_API_KEY || "",
+  },
   aws: {
     accessKeyId: process.env.AWS_ACCESS_KEY_ID || "",
     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
