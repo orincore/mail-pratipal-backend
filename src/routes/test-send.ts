@@ -1,7 +1,7 @@
 import { Router, Response } from "express";
 import { AuthenticatedRequest, authMiddleware } from "../middleware/auth";
 import { getEmailProvider } from "../providers/provider-factory";
-import { prepareEmailHtml } from "../lib/tracking-parser";
+import { prepareEmailHtml, replaceMergeTags } from "../lib/tracking-parser";
 
 const router = Router();
 
@@ -21,18 +21,26 @@ router.post("/", async (req: AuthenticatedRequest, res: Response) => {
     
     // Parse HTML to inject personalization mock values and the unsubscribe link (tracking disabled)
     const trackingUrl = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3001";
+    const mockSubscriber = {
+      email: to,
+      first_name: "Test",
+      last_name: "Recipient",
+      status: "subscribed",
+      metadata: new Map([
+        ["webinar", "Upcoming Webinar"],
+        ["company", "Pratipal"]
+      ]),
+    } as any;
+
     const parsedHtml = prepareEmailHtml({
       html,
-      subscriber: {
-        email: to,
-        first_name: "Test",
-        last_name: "Recipient",
-        status: "subscribed",
-      } as any,
+      subscriber: mockSubscriber,
       campaignId: "test-campaign",
       trackingUrl,
       trackingEnabled: { opens: false, clicks: false },
     });
+
+    const parsedSubject = replaceMergeTags(subject, mockSubscriber);
 
     console.log(`Test Send: Dispatching test email to ${to} via ${process.env.EMAIL_PROVIDER || "auto-detected driver"}`);
     
@@ -40,7 +48,7 @@ router.post("/", async (req: AuthenticatedRequest, res: Response) => {
       to,
       fromName,
       fromEmail,
-      subject,
+      subject: parsedSubject,
       html: parsedHtml,
     });
 

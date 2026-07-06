@@ -107,3 +107,29 @@ export function prepareEmailHtml({
 
   return parsedHtml;
 }
+
+/**
+ * Applies the same personalization merge tags to any plain string (e.g. email subject line).
+ * Uses the webinar title stored in subscriber.metadata("webinar") for {{webinar}}.
+ */
+export function replaceMergeTags(text: string, subscriber: IEmailSubscriber): string {
+  const name = subscriber.first_name
+    ? `${subscriber.first_name} ${subscriber.last_name || ""}`.trim()
+    : "Subscriber";
+  const firstName = subscriber.first_name || "there";
+
+  const replacements: Record<string, string> = {
+    "{{name}}": name,
+    "{{first_name}}": firstName,
+    "{{email}}": subscriber.email,
+    "{{company}}": (subscriber.metadata?.get("company") as string) || "Pratipal",
+    "{{webinar}}": (subscriber.metadata?.get("webinar") as string) || "Upcoming Webinar",
+    "{{date}}": new Date().toLocaleDateString("en-IN", { dateStyle: "long" }),
+  };
+
+  let result = text;
+  for (const [placeholder, value] of Object.entries(replacements)) {
+    result = result.replaceAll(placeholder, value);
+  }
+  return result;
+}

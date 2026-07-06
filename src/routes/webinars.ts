@@ -6,7 +6,7 @@ import EmailSubscriber from "../models/EmailSubscriber";
 import EmailTemplate from "../models/EmailTemplate";
 import { syncWebinarsFromWebsite, syncRegistrantsForWebinar, computeSendAt, webinarTag } from "../lib/webinar-sync";
 import { getEmailProvider } from "../providers/provider-factory";
-import { prepareEmailHtml } from "../lib/tracking-parser";
+import { prepareEmailHtml, replaceMergeTags } from "../lib/tracking-parser";
 
 const router = Router();
 
@@ -255,27 +255,33 @@ router.post("/:id/reminders/:reminderId/test-send", async (req: AuthenticatedReq
       `;
     }
 
+    // Build a minimal subscriber-like object so replaceMergeTags can
+    // resolve {{webinar}}, {{first_name}}, etc. in the subject line.
+    const testSubscriber = {
+      email: to,
+      first_name: "Test",
+      last_name: "Recipient",
+      status: "subscribed",
+      metadata: new Map([["webinar", webinar.title]]),
+    } as any;
+
     const trackingUrl = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3001";
     const parsedHtml = prepareEmailHtml({
       html: finalHtml,
-      subscriber: {
-        email: to,
-        first_name: "Test",
-        last_name: "Recipient",
-        status: "subscribed",
-        metadata: new Map([["webinar", webinar.title]]),
-      } as any,
+      subscriber: testSubscriber,
       campaignId: reminder._id.toString(),
       trackingUrl,
       trackingEnabled: { opens: false, clicks: false },
     });
+
+    const resolvedSubject = replaceMergeTags(`[TEST] ${reminder.subject}`, testSubscriber);
 
     const provider = getEmailProvider();
     const result = await provider.sendEmail({
       to,
       fromName: reminder.sender_name,
       fromEmail: reminder.sender_email,
-      subject: `[TEST] ${reminder.subject}`,
+      subject: resolvedSubject,
       html: parsedHtml,
     });
 

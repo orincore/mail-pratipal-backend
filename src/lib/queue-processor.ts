@@ -6,7 +6,7 @@ import EmailEvent from "../models/EmailEvent";
 import Webinar from "../models/Webinar";
 import WebinarReminder from "../models/WebinarReminder";
 import { getEmailProvider } from "../providers/provider-factory";
-import { prepareEmailHtml } from "./tracking-parser";
+import { prepareEmailHtml, replaceMergeTags } from "./tracking-parser";
 import { syncWebinarsFromWebsite, syncRegistrantsForWebinar, webinarTag } from "./webinar-sync";
 
 /**
@@ -445,7 +445,7 @@ async function processWebinarReminders(provider: any, trackingUrl: string) {
           to: sub.email,
           fromName: claimed.sender_name,
           fromEmail: claimed.sender_email,
-          subject: claimed.subject,
+          subject: replaceMergeTags(claimed.subject, sub),
           html: finalHtml,
         });
 
