@@ -13,6 +13,8 @@ export interface IWebinar extends Document {
   status: "upcoming" | "completed" | "cancelled";
   registration_start?: Date;
   registration_end?: Date;
+  join_link?: string;
+  join_platform?: "zoom" | "google_meet" | "teams" | "other";
   last_synced_at?: Date;
   created_at: Date;
   updated_at: Date;
@@ -33,6 +35,8 @@ const WebinarSchema = new Schema<IWebinar>(
     },
     registration_start: { type: Date },
     registration_end: { type: Date },
+    join_link: { type: String },
+    join_platform: { type: String, enum: ["zoom", "google_meet", "teams", "other"] },
     last_synced_at: { type: Date },
   },
   {

@@ -80,7 +80,7 @@ export function prepareEmailHtml({
   // Always append a standardized unsubscribe footer at the bottom of the email content
   const unsubscribeFooter = `
     <div style="margin-top: 30px; border-top: 1px solid #e2e8f0; padding-top: 20px; text-align: center; font-size: 12px; color: #64748b; font-family: sans-serif; line-height: 1.5;">
-      To unsubscribe from these emails, please <a href="${unsubscribeUrl}" style="color: #059669; text-decoration: underline; font-weight: 500;">click here</a>.
+      To unsubscribe from these emails, please <a href="${unsubscribeUrl}" style="color: #232d5f; text-decoration: underline; font-weight: 500;">click here</a>.
     </div>
   `;
 

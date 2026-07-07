@@ -4,6 +4,7 @@ export interface IEmailSubscriber extends Document {
   email: string;
   first_name?: string;
   last_name?: string;
+  whatsapp_number?: string;
   status: "subscribed" | "unsubscribed" | "bounced" | "complained" | "pending";
   lists: string[]; // List IDs/Names
   tags: string[];
@@ -17,6 +18,7 @@ const EmailSubscriberSchema = new Schema<IEmailSubscriber>(
     email: { type: String, required: true, unique: true, index: true, lowercase: true, trim: true },
     first_name: { type: String },
     last_name: { type: String },
+    whatsapp_number: { type: String },
     status: { type: String, enum: ["subscribed", "unsubscribed", "bounced", "complained", "pending"], default: "subscribed" },
     lists: [{ type: String, index: true }],
     tags: [{ type: String, index: true }],
