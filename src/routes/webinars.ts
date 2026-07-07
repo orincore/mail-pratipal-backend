@@ -7,6 +7,14 @@ import EmailTemplate from "../models/EmailTemplate";
 import { syncWebinarsFromWebsite, syncRegistrantsForWebinar, computeSendAt, webinarTag } from "../lib/webinar-sync";
 import { getEmailProvider } from "../providers/provider-factory";
 import { prepareEmailHtml, replaceMergeTags } from "../lib/tracking-parser";
+import { sendWhatsappTemplate } from "../providers/msg91-whatsapp.provider";
+import {
+  WHATSAPP_TEMPLATES,
+  DEFAULT_WHATSAPP_TEMPLATE_FOR_PRESET,
+  buildWhatsappTemplateParams,
+  describeOffset,
+  type WhatsappTemplateName,
+} from "../lib/whatsapp-templates";
 
 const router = Router();
 
@@ -23,6 +31,11 @@ const PRESET_OFFSETS: Record<string, { offset_type: string; offset_value?: numbe
 async function registrantCount(webinar: { source_window_id: string }) {
   return EmailSubscriber.countDocuments({ tags: webinarTag(webinar) });
 }
+
+// GET /api/webinars/meta/whatsapp-templates - approved MSG91 template metadata for the reminder UI
+router.get("/meta/whatsapp-templates", async (_req: AuthenticatedRequest, res: Response) => {
+  return res.json({ templates: WHATSAPP_TEMPLATES, defaultForPreset: DEFAULT_WHATSAPP_TEMPLATE_FOR_PRESET });
+});
 
 // GET /api/webinars - list webinars with live registrant counts + reminders
 router.get("/", async (req: AuthenticatedRequest, res: Response) => {
@@ -121,8 +134,24 @@ router.post("/:id/reminders", async (req: AuthenticatedRequest, res: Response) =
       return res.status(404).json({ error: "Webinar not found" });
     }
 
-    const { preset, offset_type, offset_value, custom_at, name, template_id, subject, sender_name, sender_email } =
-      req.body;
+    const {
+      preset,
+      offset_type,
+      offset_value,
+      custom_at,
+      name,
+      channel,
+      template_id,
+      subject,
+      sender_name,
+      sender_email,
+      whatsapp_template,
+    } = req.body;
+
+    const resolvedChannel: "email" | "whatsapp" | "both" = channel || "email";
+    if (!["email", "whatsapp", "both"].includes(resolvedChannel)) {
+      return res.status(400).json({ error: "channel must be 'email', 'whatsapp' or 'both'" });
+    }
 
     let resolvedOffsetType = offset_type;
     let resolvedOffsetValue = offset_value;
@@ -138,11 +167,24 @@ router.post("/:id/reminders", async (req: AuthenticatedRequest, res: Response) =
       resolvedName = resolvedName || p.name;
     }
 
-    if (!resolvedOffsetType || !template_id || !subject || !sender_name || !sender_email) {
-      return res.status(400).json({ error: "Missing required reminder fields" });
+    if (!resolvedOffsetType) {
+      return res.status(400).json({ error: "offset_type (or a valid preset) is required" });
     }
     if (resolvedOffsetType === "custom" && !custom_at) {
       return res.status(400).json({ error: "custom_at is required for a custom offset_type" });
+    }
+    if (resolvedChannel !== "whatsapp" && (!template_id || !subject || !sender_name || !sender_email)) {
+      return res.status(400).json({ error: "template_id, subject, sender_name and sender_email are required for the email channel" });
+    }
+
+    let resolvedWhatsappTemplate: WhatsappTemplateName | undefined = whatsapp_template;
+    if (resolvedChannel !== "email") {
+      if (!resolvedWhatsappTemplate && preset) {
+        resolvedWhatsappTemplate = DEFAULT_WHATSAPP_TEMPLATE_FOR_PRESET[preset];
+      }
+      if (!resolvedWhatsappTemplate || !WHATSAPP_TEMPLATES.some((t) => t.name === resolvedWhatsappTemplate)) {
+        return res.status(400).json({ error: "A valid whatsapp_template is required for the WhatsApp channel" });
+      }
     }
 
     const computedSendAt = computeSendAt(
@@ -151,6 +193,8 @@ router.post("/:id/reminders", async (req: AuthenticatedRequest, res: Response) =
       resolvedOffsetValue,
       custom_at ? new Date(custom_at) : undefined
     );
+    // A rule added after its own send time already passed shouldn't blast a stale reminder.
+    const initialDispatchStatus = computedSendAt.getTime() <= Date.now() ? "skipped" : "pending";
 
     const reminder = await WebinarReminder.create({
       webinar_id: webinar._id,
@@ -158,13 +202,15 @@ router.post("/:id/reminders", async (req: AuthenticatedRequest, res: Response) =
       offset_type: resolvedOffsetType,
       offset_value: resolvedOffsetValue,
       custom_at: custom_at ? new Date(custom_at) : undefined,
-      template_id,
-      subject,
-      sender_name,
-      sender_email,
+      channel: resolvedChannel,
+      template_id: resolvedChannel !== "whatsapp" ? template_id : undefined,
+      subject: resolvedChannel !== "whatsapp" ? subject : undefined,
+      sender_name: resolvedChannel !== "whatsapp" ? sender_name : undefined,
+      sender_email: resolvedChannel !== "whatsapp" ? sender_email : undefined,
+      whatsapp_template: resolvedChannel !== "email" ? resolvedWhatsappTemplate : undefined,
       computed_send_at: computedSendAt,
-      // A rule added after its own send time already passed shouldn't blast a stale reminder.
-      dispatch_status: computedSendAt.getTime() <= Date.now() ? "skipped" : "pending",
+      dispatch_status: resolvedChannel === "whatsapp" ? "skipped" : initialDispatchStatus,
+      whatsapp_dispatch_status: resolvedChannel === "email" ? "skipped" : initialDispatchStatus,
     });
 
     return res.status(201).json({ reminder });
@@ -182,12 +228,24 @@ router.put("/:id/reminders/:reminderId", async (req: AuthenticatedRequest, res: 
       return res.status(404).json({ error: "Reminder not found" });
     }
 
-    const { status, offset_type, offset_value, custom_at, subject, sender_name, sender_email, template_id, reset } =
-      req.body;
+    const {
+      status,
+      offset_type,
+      offset_value,
+      custom_at,
+      channel,
+      subject,
+      sender_name,
+      sender_email,
+      template_id,
+      whatsapp_template,
+      reset,
+    } = req.body;
 
-    if (reset && reminder.dispatch_status === "sent") {
+    if (reset) {
       // Manual-only override — resending must never happen automatically.
-      reminder.dispatch_status = "pending";
+      if (reminder.dispatch_status === "sent") reminder.dispatch_status = "pending";
+      if (reminder.whatsapp_dispatch_status === "sent") reminder.whatsapp_dispatch_status = "pending";
     }
 
     if (status) reminder.status = status;
@@ -195,9 +253,32 @@ router.put("/:id/reminders/:reminderId", async (req: AuthenticatedRequest, res: 
     if (sender_name) reminder.sender_name = sender_name;
     if (sender_email) reminder.sender_email = sender_email;
     if (template_id) reminder.template_id = template_id;
+    if (whatsapp_template) reminder.whatsapp_template = whatsapp_template;
+
+    if (channel && channel !== reminder.channel) {
+      if (!["email", "whatsapp", "both"].includes(channel)) {
+        return res.status(400).json({ error: "channel must be 'email', 'whatsapp' or 'both'" });
+      }
+      reminder.channel = channel;
+      // Re-arm/disarm whichever leg the new channel does/doesn't need — only
+      // touch legs that haven't already sent, so an in-flight/completed batch
+      // is never silently reset by a channel change.
+      const wantsEmail = channel !== "whatsapp";
+      const wantsWhatsapp = channel !== "email";
+      if (wantsEmail && reminder.dispatch_status === "skipped") {
+        reminder.dispatch_status = reminder.computed_send_at.getTime() <= Date.now() ? "skipped" : "pending";
+      } else if (!wantsEmail && reminder.dispatch_status !== "sent") {
+        reminder.dispatch_status = "skipped";
+      }
+      if (wantsWhatsapp && reminder.whatsapp_dispatch_status === "skipped") {
+        reminder.whatsapp_dispatch_status = reminder.computed_send_at.getTime() <= Date.now() ? "skipped" : "pending";
+      } else if (!wantsWhatsapp && reminder.whatsapp_dispatch_status !== "sent") {
+        reminder.whatsapp_dispatch_status = "skipped";
+      }
+    }
 
     const offsetChanged = offset_type !== undefined || offset_value !== undefined || custom_at !== undefined;
-    if (offsetChanged && reminder.dispatch_status === "pending") {
+    if (offsetChanged && (reminder.dispatch_status === "pending" || reminder.whatsapp_dispatch_status === "pending")) {
       if (offset_type !== undefined) reminder.offset_type = offset_type;
       if (offset_value !== undefined) reminder.offset_value = offset_value;
       if (custom_at !== undefined) reminder.custom_at = new Date(custom_at);
@@ -241,6 +322,9 @@ router.post("/:id/reminders/:reminderId/test-send", async (req: AuthenticatedReq
       return res.status(404).json({ error: "Webinar not found" });
     }
 
+    if (!reminder.template_id) {
+      return res.status(400).json({ error: "This reminder has no email leg configured (channel is whatsapp-only)" });
+    }
     const template = await EmailTemplate.findById(reminder.template_id);
     if (!template) {
       return res.status(404).json({ error: "Template not found for this reminder" });
@@ -288,6 +372,53 @@ router.post("/:id/reminders/:reminderId/test-send", async (req: AuthenticatedReq
     return res.json({ success: true, messageId: result.messageId, dispatched_at: new Date().toISOString() });
   } catch (error: any) {
     console.error("Webinar reminder test-send error:", error);
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/webinars/:id/reminders/:reminderId/test-send-whatsapp - send this
+// reminder's WhatsApp template to an arbitrary phone number, with real
+// merge-tag values from the webinar itself.
+router.post("/:id/reminders/:reminderId/test-send-whatsapp", async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { to } = req.body;
+    if (!to) {
+      return res.status(400).json({ error: "Recipient WhatsApp number 'to' is required" });
+    }
+
+    const reminder = await WebinarReminder.findOne({ _id: req.params.reminderId, webinar_id: req.params.id });
+    if (!reminder) {
+      return res.status(404).json({ error: "Reminder not found" });
+    }
+    if (!reminder.whatsapp_template) {
+      return res.status(400).json({ error: "This reminder has no WhatsApp leg configured" });
+    }
+
+    const webinar = await Webinar.findById(reminder.webinar_id);
+    if (!webinar) {
+      return res.status(404).json({ error: "Webinar not found" });
+    }
+
+    const relativePhrase = describeOffset(reminder.offset_type, reminder.offset_value);
+    const { bodyParams, buttonUrlSuffix } = buildWhatsappTemplateParams(reminder.whatsapp_template as WhatsappTemplateName, {
+      firstName: "Test",
+      webinarTitle: webinar.title,
+      startsAt: webinar.starts_at,
+      timezone: webinar.timezone,
+      relativeTimePhrase: relativePhrase,
+      joinSuffix: webinar._id.toString(),
+    });
+
+    const result = await sendWhatsappTemplate({
+      to,
+      templateName: reminder.whatsapp_template,
+      bodyParams,
+      buttonUrlSuffix,
+    });
+
+    return res.json({ success: true, messageId: result.messageId, dispatched_at: new Date().toISOString() });
+  } catch (error: any) {
+    console.error("Webinar reminder WhatsApp test-send error:", error);
     return res.status(500).json({ error: error.message });
   }
 });

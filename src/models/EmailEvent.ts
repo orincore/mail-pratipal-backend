@@ -5,6 +5,8 @@ export interface IEmailEvent extends Document {
   automation_id?: mongoose.Types.ObjectId;
   reminder_id?: mongoose.Types.ObjectId;
   recipient_email: string;
+  /** Which channel this event belongs to — defaults to "email" for all pre-existing rows. */
+  channel: "email" | "whatsapp";
   event_type: "sent" | "delivered" | "open" | "click" | "bounce" | "complaint" | "unsubscribe";
   timestamp: Date;
   ip_address?: string;
@@ -21,7 +23,8 @@ const EmailEventSchema = new Schema<IEmailEvent>(
     automation_id: { type: Schema.Types.ObjectId, ref: "EmailAutomation", index: true },
     reminder_id: { type: Schema.Types.ObjectId, ref: "WebinarReminder", index: true },
     recipient_email: { type: String, required: true, index: true },
-    event_type: { 
+    channel: { type: String, enum: ["email", "whatsapp"], default: "email", index: true },
+    event_type: {
       type: String, 
       enum: ["sent", "delivered", "open", "click", "bounce", "complaint", "unsubscribe"], 
       required: true, 

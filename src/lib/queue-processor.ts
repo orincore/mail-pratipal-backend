@@ -8,6 +8,8 @@ import WebinarReminder from "../models/WebinarReminder";
 import { getEmailProvider } from "../providers/provider-factory";
 import { prepareEmailHtml, replaceMergeTags } from "./tracking-parser";
 import { syncWebinarsFromWebsite, syncRegistrantsForWebinar, webinarTag } from "./webinar-sync";
+import { sendWhatsappTemplate } from "../providers/msg91-whatsapp.provider";
+import { buildWhatsappTemplateParams, describeOffset, type WhatsappTemplateName } from "./whatsapp-templates";
 
 /**
  * Executes a full queue processing sweep.
@@ -347,13 +349,18 @@ async function processAutomations(provider: any, trackingUrl: string) {
 /**
  * Handles dispatch of due webinar reminder emails.
  */
+const BATCH_LIMIT = 50;
+
 async function processWebinarReminders(provider: any, trackingUrl: string) {
   await syncWebinarsFromWebsite();
 
   const dueReminders = await WebinarReminder.find({
     status: "active",
-    dispatch_status: { $in: ["pending", "sending"] }, // "sending" = resuming a partially-sent batch
     computed_send_at: { $lte: new Date() },
+    $or: [
+      { dispatch_status: { $in: ["pending", "sending"] } }, // "sending" = resuming a partially-sent batch
+      { whatsapp_dispatch_status: { $in: ["pending", "sending"] } },
+    ],
   }).populate("webinar_id");
 
   const summary = [];
@@ -363,7 +370,8 @@ async function processWebinarReminders(provider: any, trackingUrl: string) {
     if (!webinar) continue;
 
     if (webinar.status === "cancelled") {
-      reminder.dispatch_status = "skipped";
+      if (["pending", "sending"].includes(reminder.dispatch_status)) reminder.dispatch_status = "skipped";
+      if (["pending", "sending"].includes(reminder.whatsapp_dispatch_status)) reminder.whatsapp_dispatch_status = "skipped";
       await reminder.save();
       summary.push({ reminderId: reminder._id, status: "skipped", reason: "Webinar cancelled" });
       continue;
@@ -373,122 +381,239 @@ async function processWebinarReminders(provider: any, trackingUrl: string) {
       continue;
     }
 
-    let claimed = reminder;
-    if (reminder.dispatch_status === "pending") {
-      // Atomically claim this reminder so a concurrent sweep (worker + /api/jobs/process
-      // cron) can't both start dispatching the same first batch.
-      const result = await WebinarReminder.findOneAndUpdate(
-        { _id: reminder._id, dispatch_status: "pending" },
-        { $set: { dispatch_status: "sending" } },
-        { new: true }
-      );
-      if (!result) continue;
-      claimed = result;
-    }
-
-    const template = await EmailTemplate.findById(reminder.template_id);
-    if (!template) {
-      claimed.dispatch_status = "skipped";
-      await claimed.save();
-      summary.push({ reminderId: reminder._id, status: "failed", error: "Template not found" });
-      continue;
-    }
-
     await syncRegistrantsForWebinar(webinar);
-
     const tag = webinarTag(webinar);
-    const subscribers = await EmailSubscriber.find({ status: "subscribed", tags: tag });
 
-    const sentEmails = await EmailEvent.find({
-      reminder_id: claimed._id,
-      event_type: "sent",
-    }).distinct("recipient_email");
-    const sentEmailsSet = new Set(sentEmails.map((e) => e.toLowerCase()));
-
-    const pendingSubscribers = subscribers.filter(
-      (sub) => !sentEmailsSet.has(sub.email.toLowerCase())
-    );
-
-    if (pendingSubscribers.length === 0) {
-      claimed.dispatch_status = "sent";
-      await claimed.save();
-      summary.push({ reminderId: claimed._id, status: "sent", message: "Empty audience" });
-      continue;
+    if (["pending", "sending"].includes(reminder.dispatch_status)) {
+      const result = await sendEmailLegForReminder(reminder, webinar, tag, provider, trackingUrl);
+      if (result) summary.push(result);
     }
 
-    const BATCH_LIMIT = 50;
-    const batch = pendingSubscribers.slice(0, BATCH_LIMIT);
-
-    let sentInBatch = 0;
-    let failedInBatch = 0;
-
-    for (const sub of batch) {
-      try {
-        const customizedHtml = prepareEmailHtml({
-          html: template.html_content || "",
-          subscriber: sub,
-          campaignId: claimed._id.toString(),
-          trackingUrl,
-          trackingEnabled: { opens: true, clicks: true },
-        });
-
-        let finalHtml = customizedHtml;
-        if (template.type === "text") {
-          finalHtml = `
-            <div style="font-family: sans-serif; font-size: 15px; color: #1e293b; white-space: pre-wrap; line-height: 1.6;">
-              ${customizedHtml}
-            </div>
-          `;
-        }
-
-        const { messageId } = await provider.sendEmail({
-          to: sub.email,
-          fromName: claimed.sender_name,
-          fromEmail: claimed.sender_email,
-          subject: replaceMergeTags(claimed.subject, sub),
-          html: finalHtml,
-        });
-
-        await EmailEvent.create({
-          reminder_id: claimed._id,
-          recipient_email: sub.email.toLowerCase(),
-          event_type: "sent",
-          timestamp: new Date(),
-          details: { messageId },
-        });
-
-        sentInBatch++;
-      } catch (err: any) {
-        console.error(`Failed to send webinar reminder to ${sub.email}:`, err);
-        await EmailEvent.create({
-          reminder_id: claimed._id,
-          recipient_email: sub.email.toLowerCase(),
-          event_type: "bounce",
-          timestamp: new Date(),
-          details: { error: err.message },
-        });
-        failedInBatch++;
-      }
+    if (["pending", "sending"].includes(reminder.whatsapp_dispatch_status)) {
+      const result = await sendWhatsappLegForReminder(reminder, webinar, tag);
+      if (result) summary.push(result);
     }
-
-    claimed.stats.sent += sentInBatch;
-    claimed.stats.bounces += failedInBatch;
-
-    if (pendingSubscribers.length <= BATCH_LIMIT) {
-      claimed.dispatch_status = "sent";
-    } else {
-      claimed.dispatch_status = "sending"; // resumed on the next sweep
-    }
-
-    await claimed.save();
-    summary.push({
-      reminderId: claimed._id,
-      status: claimed.dispatch_status,
-      sentCount: sentInBatch,
-      failedCount: failedInBatch,
-      remaining: Math.max(0, pendingSubscribers.length - BATCH_LIMIT),
-    });
   }
 
   return summary;
+}
+
+async function sendEmailLegForReminder(reminder: any, webinar: any, tag: string, provider: any, trackingUrl: string) {
+  let claimed = reminder;
+  if (reminder.dispatch_status === "pending") {
+    // Atomically claim this leg so a concurrent sweep (worker + /api/jobs/process
+    // cron) can't both start dispatching the same first batch.
+    const result = await WebinarReminder.findOneAndUpdate(
+      { _id: reminder._id, dispatch_status: "pending" },
+      { $set: { dispatch_status: "sending" } },
+      { new: true }
+    );
+    if (!result) return null;
+    claimed = result;
+  }
+
+  const template = await EmailTemplate.findById(claimed.template_id);
+  if (!template) {
+    claimed.dispatch_status = "skipped";
+    await claimed.save();
+    return { reminderId: reminder._id, channel: "email", status: "failed", error: "Template not found" };
+  }
+
+  const subscribers = await EmailSubscriber.find({ status: "subscribed", tags: tag });
+
+  const sentEmails = await EmailEvent.find({
+    reminder_id: claimed._id,
+    channel: "email",
+    event_type: "sent",
+  }).distinct("recipient_email");
+  const sentEmailsSet = new Set(sentEmails.map((e) => e.toLowerCase()));
+
+  const pendingSubscribers = subscribers.filter((sub) => !sentEmailsSet.has(sub.email.toLowerCase()));
+
+  if (pendingSubscribers.length === 0) {
+    claimed.dispatch_status = "sent";
+    await claimed.save();
+    return { reminderId: claimed._id, channel: "email", status: "sent", message: "Empty audience" };
+  }
+
+  const batch = pendingSubscribers.slice(0, BATCH_LIMIT);
+
+  let sentInBatch = 0;
+  let failedInBatch = 0;
+
+  for (const sub of batch) {
+    try {
+      const customizedHtml = prepareEmailHtml({
+        html: template.html_content || "",
+        subscriber: sub,
+        campaignId: claimed._id.toString(),
+        trackingUrl,
+        trackingEnabled: { opens: true, clicks: true },
+      });
+
+      let finalHtml = customizedHtml;
+      if (template.type === "text") {
+        finalHtml = `
+          <div style="font-family: sans-serif; font-size: 15px; color: #1e293b; white-space: pre-wrap; line-height: 1.6;">
+            ${customizedHtml}
+          </div>
+        `;
+      }
+
+      const { messageId } = await provider.sendEmail({
+        to: sub.email,
+        fromName: claimed.sender_name,
+        fromEmail: claimed.sender_email,
+        subject: replaceMergeTags(claimed.subject, sub),
+        html: finalHtml,
+      });
+
+      await EmailEvent.create({
+        reminder_id: claimed._id,
+        recipient_email: sub.email.toLowerCase(),
+        channel: "email",
+        event_type: "sent",
+        timestamp: new Date(),
+        details: { messageId },
+      });
+
+      sentInBatch++;
+    } catch (err: any) {
+      console.error(`Failed to send webinar reminder email to ${sub.email}:`, err);
+      await EmailEvent.create({
+        reminder_id: claimed._id,
+        recipient_email: sub.email.toLowerCase(),
+        channel: "email",
+        event_type: "bounce",
+        timestamp: new Date(),
+        details: { error: err.message },
+      });
+      failedInBatch++;
+    }
+  }
+
+  claimed.stats.sent += sentInBatch;
+  claimed.stats.bounces += failedInBatch;
+  claimed.dispatch_status = pendingSubscribers.length <= BATCH_LIMIT ? "sent" : "sending";
+  await claimed.save();
+
+  return {
+    reminderId: claimed._id,
+    channel: "email",
+    status: claimed.dispatch_status,
+    sentCount: sentInBatch,
+    failedCount: failedInBatch,
+    remaining: Math.max(0, pendingSubscribers.length - BATCH_LIMIT),
+  };
+}
+
+async function sendWhatsappLegForReminder(reminder: any, webinar: any, tag: string) {
+  let claimed = reminder;
+  if (reminder.whatsapp_dispatch_status === "pending") {
+    const result = await WebinarReminder.findOneAndUpdate(
+      { _id: reminder._id, whatsapp_dispatch_status: "pending" },
+      { $set: { whatsapp_dispatch_status: "sending" } },
+      { new: true }
+    );
+    if (!result) return null;
+    claimed = result;
+  }
+
+  if (!claimed.whatsapp_template) {
+    claimed.whatsapp_dispatch_status = "skipped";
+    await claimed.save();
+    return { reminderId: reminder._id, channel: "whatsapp", status: "failed", error: "No whatsapp_template set" };
+  }
+
+  const subscribers = await EmailSubscriber.find({ status: "subscribed", tags: tag });
+
+  const sentTo = await EmailEvent.find({
+    reminder_id: claimed._id,
+    channel: "whatsapp",
+    event_type: "sent",
+  }).distinct("recipient_email");
+  const sentSet = new Set(sentTo.map((e) => e.toLowerCase()));
+
+  const pendingSubscribers = subscribers.filter((sub) => !sentSet.has(sub.email.toLowerCase()));
+
+  if (pendingSubscribers.length === 0) {
+    claimed.whatsapp_dispatch_status = "sent";
+    await claimed.save();
+    return { reminderId: claimed._id, channel: "whatsapp", status: "sent", message: "Empty audience" };
+  }
+
+  const batch = pendingSubscribers.slice(0, BATCH_LIMIT);
+  const relativePhrase = describeOffset(claimed.offset_type, claimed.offset_value);
+
+  let sentInBatch = 0;
+  let failedInBatch = 0;
+
+  for (const sub of batch) {
+    if (!sub.whatsapp_number) {
+      failedInBatch++;
+      await EmailEvent.create({
+        reminder_id: claimed._id,
+        recipient_email: sub.email.toLowerCase(),
+        channel: "whatsapp",
+        event_type: "bounce",
+        timestamp: new Date(),
+        details: { error: "No WhatsApp number on file" },
+      });
+      continue;
+    }
+
+    try {
+      const { bodyParams, buttonUrlSuffix } = buildWhatsappTemplateParams(claimed.whatsapp_template as WhatsappTemplateName, {
+        firstName: sub.first_name || "there",
+        webinarTitle: webinar.title,
+        startsAt: webinar.starts_at,
+        timezone: webinar.timezone,
+        relativeTimePhrase: relativePhrase,
+        joinSuffix: webinar._id.toString(),
+      });
+
+      const result = await sendWhatsappTemplate({
+        to: sub.whatsapp_number,
+        templateName: claimed.whatsapp_template,
+        bodyParams,
+        buttonUrlSuffix,
+      });
+
+      await EmailEvent.create({
+        reminder_id: claimed._id,
+        recipient_email: sub.email.toLowerCase(),
+        channel: "whatsapp",
+        event_type: "sent",
+        timestamp: new Date(),
+        details: { messageId: result.messageId },
+      });
+
+      sentInBatch++;
+    } catch (err: any) {
+      console.error(`Failed to send webinar reminder WhatsApp message to ${sub.whatsapp_number}:`, err);
+      await EmailEvent.create({
+        reminder_id: claimed._id,
+        recipient_email: sub.email.toLowerCase(),
+        channel: "whatsapp",
+        event_type: "bounce",
+        timestamp: new Date(),
+        details: { error: err.message },
+      });
+      failedInBatch++;
+    }
+  }
+
+  claimed.stats.whatsapp_sent += sentInBatch;
+  claimed.stats.whatsapp_failed += failedInBatch;
+  claimed.whatsapp_dispatch_status = pendingSubscribers.length <= BATCH_LIMIT ? "sent" : "sending";
+  await claimed.save();
+
+  return {
+    reminderId: claimed._id,
+    channel: "whatsapp",
+    status: claimed.whatsapp_dispatch_status,
+    sentCount: sentInBatch,
+    failedCount: failedInBatch,
+    remaining: Math.max(0, pendingSubscribers.length - BATCH_LIMIT),
+  };
 }

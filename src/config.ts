@@ -26,5 +26,13 @@ export const config = {
     email: process.env.SHIPROCKET_EMAIL || "",
     password: process.env.SHIPROCKET_PASSWORD || "",
     mock: process.env.SHIPROCKET_MOCK === "true",
-  }
+  },
+  whatsapp: {
+    msg91: {
+      authKey: process.env.MSG91_AUTH_KEY || "",
+      integratedNumber: process.env.MSG91_WHATSAPP_INTEGRATED_NUMBER || "",
+      namespace: process.env.MSG91_WHATSAPP_NAMESPACE || "",
+      languageCode: process.env.MSG91_WHATSAPP_LANGUAGE_CODE || "en",
+    },
+  },
 };

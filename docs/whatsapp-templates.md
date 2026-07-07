@@ -43,7 +43,7 @@ Hi {{1}}, your seat for *{{2}}* is confirmed. It's scheduled on {{3}} at {{4}} (
 
 ---
 
-## 2. `webinar_reminder`
+## 2. `webinar_remind`
 
 **Trigger:** reused for the `3_days_before` / `2_days_before` / `1_day_before`
 presets and any custom day/hour offset in `WebinarReminder`. Only the relative-time
