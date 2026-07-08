@@ -20,10 +20,10 @@ router.get("/failed-events", async (req: AuthenticatedRequest, res: Response) =>
     const failedEvents = await EmailEvent.find({
       event_type: { $in: ["bounce", "complaint"] }
     })
-    .sort({ timestamp: -1 })
-    .populate("campaign_id", "name")
-    .limit(100);
-    
+      .sort({ timestamp: -1 })
+      .populate("campaign_id", "name")
+      .limit(100);
+
     return res.json(failedEvents);
   } catch (error: any) {
     console.error("GET failed-events error:", error);
@@ -52,7 +52,7 @@ router.get("/dashboard-stats", async (req: AuthenticatedRequest, res: Response) 
 
     // 2. Fetch metrics from MongoDB within timeframe
     const totalSubscribers = await EmailSubscriber.countDocuments({ status: "subscribed" });
-    
+
     // Email specific metrics (exclude WhatsApp)
     const totalSent = await EmailEvent.countDocuments({ event_type: "sent", channel: { $ne: "whatsapp" }, ...eventQuery });
     const totalOpens = await EmailEvent.countDocuments({ event_type: "open", ...eventQuery });
@@ -64,7 +64,7 @@ router.get("/dashboard-stats", async (req: AuthenticatedRequest, res: Response) 
     const totalWhatsappSent = await EmailEvent.countDocuments({ event_type: "sent", channel: "whatsapp", ...eventQuery });
     const totalWhatsappFailed = await EmailEvent.countDocuments({ event_type: "bounce", channel: "whatsapp", ...eventQuery });
     const totalWhatsappOpens = await EmailEvent.countDocuments({ event_type: "open", channel: "whatsapp", ...eventQuery });
-    
+
     const activeSchedules = await EmailCampaign.countDocuments({ status: "scheduled" });
 
     // 3. Fetch recent campaigns
@@ -142,9 +142,9 @@ router.get("/dashboard-stats", async (req: AuthenticatedRequest, res: Response) 
         });
 
         chartStatsPush(
-          dailyStats, 
-          day.toLocaleDateString("en-IN", { month: "short", day: "numeric" }), 
-          sent, 
+          dailyStats,
+          day.toLocaleDateString("en-IN", { month: "short", day: "numeric" }),
+          sent,
           opens,
           whatsappSent,
           whatsappFailed
@@ -183,9 +183,9 @@ router.get("/dashboard-stats", async (req: AuthenticatedRequest, res: Response) 
         });
 
         chartStatsPush(
-          dailyStats, 
-          day.toLocaleDateString("en-IN", { month: "short", day: "numeric" }), 
-          sent, 
+          dailyStats,
+          day.toLocaleDateString("en-IN", { month: "short", day: "numeric" }),
+          sent,
           opens,
           whatsappSent,
           whatsappFailed
