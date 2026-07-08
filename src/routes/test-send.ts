@@ -2,11 +2,49 @@ import { Router, Response } from "express";
 import { AuthenticatedRequest, authMiddleware } from "../middleware/auth";
 import { getEmailProvider } from "../providers/provider-factory";
 import { prepareEmailHtml, replaceMergeTags } from "../lib/tracking-parser";
+import { sendWhatsappTemplate } from "../providers/msg91-whatsapp.provider";
+import { buildWhatsappTemplateParams, type WhatsappTemplateName } from "../lib/whatsapp-templates";
 
 const router = Router();
 
 // Apply auth middleware to all routes in this file
 router.use(authMiddleware);
+
+// POST /api/test-send/whatsapp - Dispatch test WhatsApp template
+router.post("/whatsapp", async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { to, templateName, eventName = "Test Campaign" } = req.body;
+
+    if (!to || !templateName) {
+      return res.status(400).json({ error: "Required fields (to, templateName) are missing" });
+    }
+
+    const { bodyParams, buttonUrlSuffix } = buildWhatsappTemplateParams(templateName as WhatsappTemplateName, {
+      firstName: "Test Recipient",
+      webinarTitle: eventName,
+      startsAt: new Date(),
+      timezone: "Asia/Kolkata",
+    });
+
+    console.log(`Test WhatsApp Send: Dispatching test message to ${to}`);
+
+    const result = await sendWhatsappTemplate({
+      to,
+      templateName,
+      bodyParams,
+      buttonUrlSuffix,
+    });
+
+    return res.json({
+      success: true,
+      messageId: result.messageId,
+      dispatched_at: new Date().toISOString(),
+    });
+  } catch (error: any) {
+    console.error("Test WhatsApp send API error:", error);
+    return res.status(500).json({ error: error.message });
+  }
+});
 
 // POST /api/test-send - Dispatch test email
 router.post("/", async (req: AuthenticatedRequest, res: Response) => {

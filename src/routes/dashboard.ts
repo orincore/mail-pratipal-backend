@@ -52,11 +52,18 @@ router.get("/dashboard-stats", async (req: AuthenticatedRequest, res: Response) 
 
     // 2. Fetch metrics from MongoDB within timeframe
     const totalSubscribers = await EmailSubscriber.countDocuments({ status: "subscribed" });
-    const totalSent = await EmailEvent.countDocuments({ event_type: "sent", ...eventQuery });
+    
+    // Email specific metrics (exclude WhatsApp)
+    const totalSent = await EmailEvent.countDocuments({ event_type: "sent", channel: { $ne: "whatsapp" }, ...eventQuery });
     const totalOpens = await EmailEvent.countDocuments({ event_type: "open", ...eventQuery });
     const totalClicks = await EmailEvent.countDocuments({ event_type: "click", ...eventQuery });
-    const totalBounces = await EmailEvent.countDocuments({ event_type: "bounce", ...eventQuery });
+    const totalBounces = await EmailEvent.countDocuments({ event_type: "bounce", channel: { $ne: "whatsapp" }, ...eventQuery });
     const totalComplaints = await EmailEvent.countDocuments({ event_type: "complaint", ...eventQuery });
+
+    // WhatsApp specific metrics
+    const totalWhatsappSent = await EmailEvent.countDocuments({ event_type: "sent", channel: "whatsapp", ...eventQuery });
+    const totalWhatsappFailed = await EmailEvent.countDocuments({ event_type: "bounce", channel: "whatsapp", ...eventQuery });
+    const totalWhatsappOpens = await EmailEvent.countDocuments({ event_type: "open", channel: "whatsapp", ...eventQuery });
     
     const activeSchedules = await EmailCampaign.countDocuments({ status: "scheduled" });
 
@@ -67,7 +74,7 @@ router.get("/dashboard-stats", async (req: AuthenticatedRequest, res: Response) 
       .populate("template_id", "name");
 
     // 4. Generate performance timeline stats based on timeframe
-    const dailyStats = [];
+    const dailyStats: any[] = [];
 
     if (timeframe === "daily") {
       // 24 hours of today
@@ -79,6 +86,7 @@ router.get("/dashboard-stats", async (req: AuthenticatedRequest, res: Response) 
 
         const sent = await EmailEvent.countDocuments({
           event_type: "sent",
+          channel: { $ne: "whatsapp" },
           timestamp: { $gte: startOfHour, $lte: endOfHour },
         });
 
@@ -87,7 +95,19 @@ router.get("/dashboard-stats", async (req: AuthenticatedRequest, res: Response) 
           timestamp: { $gte: startOfHour, $lte: endOfHour },
         });
 
-        chartStatsPush(dailyStats, `${i.toString().padStart(2, "0")}:00`, sent, opens);
+        const whatsappSent = await EmailEvent.countDocuments({
+          event_type: "sent",
+          channel: "whatsapp",
+          timestamp: { $gte: startOfHour, $lte: endOfHour },
+        });
+
+        const whatsappFailed = await EmailEvent.countDocuments({
+          event_type: "bounce",
+          channel: "whatsapp",
+          timestamp: { $gte: startOfHour, $lte: endOfHour },
+        });
+
+        chartStatsPush(dailyStats, `${i.toString().padStart(2, "0")}:00`, sent, opens, whatsappSent, whatsappFailed);
       }
     } else if (timeframe === "monthly") {
       // 30 days
@@ -100,6 +120,7 @@ router.get("/dashboard-stats", async (req: AuthenticatedRequest, res: Response) 
 
         const sent = await EmailEvent.countDocuments({
           event_type: "sent",
+          channel: { $ne: "whatsapp" },
           timestamp: { $gte: startOfDay, $lte: endOfDay },
         });
 
@@ -108,11 +129,25 @@ router.get("/dashboard-stats", async (req: AuthenticatedRequest, res: Response) 
           timestamp: { $gte: startOfDay, $lte: endOfDay },
         });
 
+        const whatsappSent = await EmailEvent.countDocuments({
+          event_type: "sent",
+          channel: "whatsapp",
+          timestamp: { $gte: startOfDay, $lte: endOfDay },
+        });
+
+        const whatsappFailed = await EmailEvent.countDocuments({
+          event_type: "bounce",
+          channel: "whatsapp",
+          timestamp: { $gte: startOfDay, $lte: endOfDay },
+        });
+
         chartStatsPush(
           dailyStats, 
           day.toLocaleDateString("en-IN", { month: "short", day: "numeric" }), 
           sent, 
-          opens
+          opens,
+          whatsappSent,
+          whatsappFailed
         );
       }
     } else {
@@ -126,6 +161,7 @@ router.get("/dashboard-stats", async (req: AuthenticatedRequest, res: Response) 
 
         const sent = await EmailEvent.countDocuments({
           event_type: "sent",
+          channel: { $ne: "whatsapp" },
           timestamp: { $gte: startOfDay, $lte: endOfDay },
         });
 
@@ -134,11 +170,25 @@ router.get("/dashboard-stats", async (req: AuthenticatedRequest, res: Response) 
           timestamp: { $gte: startOfDay, $lte: endOfDay },
         });
 
+        const whatsappSent = await EmailEvent.countDocuments({
+          event_type: "sent",
+          channel: "whatsapp",
+          timestamp: { $gte: startOfDay, $lte: endOfDay },
+        });
+
+        const whatsappFailed = await EmailEvent.countDocuments({
+          event_type: "bounce",
+          channel: "whatsapp",
+          timestamp: { $gte: startOfDay, $lte: endOfDay },
+        });
+
         chartStatsPush(
           dailyStats, 
           day.toLocaleDateString("en-IN", { month: "short", day: "numeric" }), 
           sent, 
-          opens
+          opens,
+          whatsappSent,
+          whatsappFailed
         );
       }
     }
@@ -150,6 +200,9 @@ router.get("/dashboard-stats", async (req: AuthenticatedRequest, res: Response) 
       totalClicks,
       totalBounces,
       totalComplaints,
+      totalWhatsappSent,
+      totalWhatsappFailed,
+      totalWhatsappOpens,
       activeSchedules,
       recentCampaigns,
       dailyStats,
@@ -161,8 +214,8 @@ router.get("/dashboard-stats", async (req: AuthenticatedRequest, res: Response) 
   }
 });
 
-function chartStatsPush(arr: any[], dateLabel: string, sent: number, opens: number) {
-  arr.push({ dateLabel, sent, opens });
+function chartStatsPush(arr: any[], dateLabel: string, sent: number, opens: number, whatsappSent: number, whatsappFailed: number) {
+  arr.push({ dateLabel, sent, opens, whatsappSent, whatsappFailed });
 }
 
 export default router;

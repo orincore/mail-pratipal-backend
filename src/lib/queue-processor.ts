@@ -49,135 +49,303 @@ async function processCampaigns(provider: any, trackingUrl: string) {
       await campaign.save();
     }
 
-    const template = await EmailTemplate.findById(campaign.template_id);
-    if (!template) {
-      campaign.status = "paused";
-      await campaign.save();
-      summary.push({ campaignId: campaign._id, status: "failed", error: "Template not found" });
-      continue;
-    }
+    let emailResult = null;
+    let whatsappResult = null;
 
-    // Resolve the target audience
-    const audienceQuery: any = { status: "subscribed" };
-
-    if (!campaign.audience.all) {
-      const matchCriteria = [];
-      if (campaign.audience.lists?.length > 0) {
-        matchCriteria.push({ lists: { $in: campaign.audience.lists } });
-      }
-      if (campaign.audience.tags?.length > 0) {
-        matchCriteria.push({ tags: { $in: campaign.audience.tags } });
-      }
-      
-      if (matchCriteria.length > 0) {
-        audienceQuery["$or"] = matchCriteria;
-      } else {
-        campaign.status = "sent";
-        campaign.sent_at = new Date();
-        await campaign.save();
-        summary.push({ campaignId: campaign._id, status: "completed", message: "Empty audience" });
-        continue;
+    // Check Email leg
+    if (["pending", "sending"].includes(campaign.dispatch_status)) {
+      emailResult = await sendEmailLegForCampaign(campaign, provider, trackingUrl);
+      if (emailResult) {
+        campaign.dispatch_status = emailResult.status;
       }
     }
 
-    // Find subscribers who have not yet received the email
-    const subscribers = await EmailSubscriber.find(audienceQuery);
-    
-    const sentEmails = await EmailEvent.find({
-      campaign_id: campaign._id,
-      event_type: "sent"
-    }).distinct("recipient_email");
+    // Check WhatsApp leg
+    if (["pending", "sending"].includes(campaign.whatsapp_dispatch_status)) {
+      whatsappResult = await sendWhatsappLegForCampaign(campaign);
+      if (whatsappResult) {
+        campaign.whatsapp_dispatch_status = whatsappResult.status;
+      }
+    }
 
-    const sentEmailsSet = new Set(sentEmails.map(e => e.toLowerCase()));
+    // Check if both legs are completed
+    const emailDone = ["sent", "skipped"].includes(campaign.dispatch_status);
+    const whatsappDone = ["sent", "skipped"].includes(campaign.whatsapp_dispatch_status);
 
-    const pendingSubscribers = subscribers.filter(
-      (sub) => !sentEmailsSet.has(sub.email.toLowerCase())
-    );
-
-    if (pendingSubscribers.length === 0) {
+    if (emailDone && whatsappDone) {
       campaign.status = "sent";
       campaign.sent_at = new Date();
       await campaign.save();
-      summary.push({ campaignId: campaign._id, status: "completed" });
-      continue;
     }
 
-    // Batch send limit to prevent SMTP timeouts
-    const BATCH_LIMIT = 50;
-    const batch = pendingSubscribers.slice(0, BATCH_LIMIT);
-
-    let sentInBatch = 0;
-    let failedInBatch = 0;
-
-    for (const sub of batch) {
-      try {
-        const customizedHtml = prepareEmailHtml({
-          html: template.html_content || "",
-          subscriber: sub,
-          campaignId: campaign._id.toString(),
-          trackingUrl,
-          trackingEnabled: campaign.tracking,
-        });
-
-        let finalHtml = customizedHtml;
-        if (template.type === "text") {
-          finalHtml = `
-            <div style="font-family: sans-serif; font-size: 15px; color: #1e293b; white-space: pre-wrap; line-height: 1.6;">
-              ${customizedHtml}
-            </div>
-          `;
-        }
-
-        const { messageId } = await provider.sendEmail({
-          to: sub.email,
-          fromName: campaign.sender_name,
-          fromEmail: campaign.sender_email,
-          subject: campaign.subject,
-          html: finalHtml,
-          replyTo: campaign.reply_to,
-        });
-
-        await EmailEvent.create({
-          campaign_id: campaign._id,
-          recipient_email: sub.email.toLowerCase(),
-          event_type: "sent",
-          timestamp: new Date(),
-          details: { messageId }
-        });
-
-        sentInBatch++;
-      } catch (err: any) {
-        console.error(`Failed to send campaign email to ${sub.email}:`, err);
-        await EmailEvent.create({
-          campaign_id: campaign._id,
-          recipient_email: sub.email.toLowerCase(),
-          event_type: "bounce",
-          timestamp: new Date(),
-          details: { error: err.message }
-        });
-        failedInBatch++;
-      }
+    if (emailResult || whatsappResult) {
+      summary.push({
+        campaignId: campaign._id,
+        status: campaign.status,
+        email: emailResult,
+        whatsapp: whatsappResult,
+      });
     }
-
-    campaign.stats.sent += sentInBatch;
-    campaign.stats.bounces += failedInBatch;
-    
-    if (pendingSubscribers.length <= BATCH_LIMIT) {
-      campaign.status = "sent";
-      campaign.sent_at = new Date();
-    }
-    
-    await campaign.save();
-    summary.push({
-      campaignId: campaign._id,
-      status: campaign.status,
-      sentCount: sentInBatch,
-      failedCount: failedInBatch,
-      remaining: Math.max(0, pendingSubscribers.length - BATCH_LIMIT),
-    });
   }
 
   return summary;
+}
+
+async function sendEmailLegForCampaign(campaign: any, provider: any, trackingUrl: string) {
+  let claimed = campaign;
+  if (campaign.dispatch_status === "pending") {
+    const result = await EmailCampaign.findOneAndUpdate(
+      { _id: campaign._id, dispatch_status: "pending" },
+      { $set: { dispatch_status: "sending" } },
+      { new: true }
+    );
+    if (!result) return null;
+    claimed = result;
+  }
+
+  const template = await EmailTemplate.findById(claimed.template_id);
+  if (!template) {
+    claimed.dispatch_status = "skipped";
+    await claimed.save();
+    return { status: "skipped", error: "Template not found" };
+  }
+
+  // Resolve the target audience
+  const audienceQuery: any = { status: "subscribed" };
+
+  if (!claimed.audience.all) {
+    const matchCriteria = [];
+    if (claimed.audience.lists?.length > 0) {
+      matchCriteria.push({ lists: { $in: claimed.audience.lists } });
+    }
+    if (claimed.audience.tags?.length > 0) {
+      matchCriteria.push({ tags: { $in: claimed.audience.tags } });
+    }
+    
+    if (matchCriteria.length > 0) {
+      audienceQuery["$or"] = matchCriteria;
+    } else {
+      claimed.dispatch_status = "sent";
+      await claimed.save();
+      return { status: "sent", message: "Empty audience" };
+    }
+  }
+
+  const subscribers = await EmailSubscriber.find(audienceQuery);
+  
+  const sentEmails = await EmailEvent.find({
+    campaign_id: claimed._id,
+    channel: "email",
+    event_type: "sent"
+  }).distinct("recipient_email");
+
+  const sentEmailsSet = new Set(sentEmails.map(e => e.toLowerCase()));
+
+  const pendingSubscribers = subscribers.filter(
+    (sub) => !sentEmailsSet.has(sub.email.toLowerCase())
+  );
+
+  if (pendingSubscribers.length === 0) {
+    claimed.dispatch_status = "sent";
+    await claimed.save();
+    return { status: "sent" };
+  }
+
+  const BATCH_LIMIT = 50;
+  const batch = pendingSubscribers.slice(0, BATCH_LIMIT);
+
+  let sentInBatch = 0;
+  let failedInBatch = 0;
+
+  for (const sub of batch) {
+    try {
+      const customizedHtml = prepareEmailHtml({
+        html: template.html_content || "",
+        subscriber: sub,
+        campaignId: claimed._id.toString(),
+        trackingUrl,
+        trackingEnabled: claimed.tracking,
+      });
+
+      let finalHtml = customizedHtml;
+      if (template.type === "text") {
+        finalHtml = `
+          <div style="font-family: sans-serif; font-size: 15px; color: #1e293b; white-space: pre-wrap; line-height: 1.6;">
+            ${customizedHtml}
+          </div>
+        `;
+      }
+
+      const { messageId } = await provider.sendEmail({
+        to: sub.email,
+        fromName: claimed.sender_name,
+        fromEmail: claimed.sender_email,
+        subject: replaceMergeTags(claimed.subject || "", sub),
+        html: finalHtml,
+        replyTo: claimed.reply_to,
+      });
+
+      await EmailEvent.create({
+        campaign_id: claimed._id,
+        recipient_email: sub.email.toLowerCase(),
+        channel: "email",
+        event_type: "sent",
+        timestamp: new Date(),
+        details: { messageId }
+      });
+
+      sentInBatch++;
+    } catch (err: any) {
+      console.error(`Failed to send campaign email to ${sub.email}:`, err);
+      await EmailEvent.create({
+        campaign_id: claimed._id,
+        recipient_email: sub.email.toLowerCase(),
+        channel: "email",
+        event_type: "bounce",
+        timestamp: new Date(),
+        details: { error: err.message }
+      });
+      failedInBatch++;
+    }
+  }
+
+  claimed.stats.sent += sentInBatch;
+  claimed.stats.bounces += failedInBatch;
+  claimed.dispatch_status = pendingSubscribers.length <= BATCH_LIMIT ? "sent" : "sending";
+  await claimed.save();
+
+  return {
+    status: claimed.dispatch_status,
+    sentCount: sentInBatch,
+    failedCount: failedInBatch,
+    remaining: Math.max(0, pendingSubscribers.length - BATCH_LIMIT),
+  };
+}
+
+async function sendWhatsappLegForCampaign(campaign: any) {
+  let claimed = campaign;
+  if (campaign.whatsapp_dispatch_status === "pending") {
+    const result = await EmailCampaign.findOneAndUpdate(
+      { _id: campaign._id, whatsapp_dispatch_status: "pending" },
+      { $set: { whatsapp_dispatch_status: "sending" } },
+      { new: true }
+    );
+    if (!result) return null;
+    claimed = result;
+  }
+
+  if (!claimed.whatsapp_template) {
+    claimed.whatsapp_dispatch_status = "skipped";
+    await claimed.save();
+    return { status: "skipped", error: "No whatsapp_template set" };
+  }
+
+  // Resolve the target audience
+  const audienceQuery: any = { status: "subscribed" };
+
+  if (!claimed.audience.all) {
+    const matchCriteria = [];
+    if (claimed.audience.lists?.length > 0) {
+      matchCriteria.push({ lists: { $in: claimed.audience.lists } });
+    }
+    if (claimed.audience.tags?.length > 0) {
+      matchCriteria.push({ tags: { $in: claimed.audience.tags } });
+    }
+    
+    if (matchCriteria.length > 0) {
+      claimed.whatsapp_dispatch_status = "sent";
+      await claimed.save();
+      return { status: "sent", message: "Empty audience" };
+    }
+  }
+
+  const subscribers = await EmailSubscriber.find(audienceQuery);
+
+  const sentTo = await EmailEvent.find({
+    campaign_id: claimed._id,
+    channel: "whatsapp",
+    event_type: "sent",
+  }).distinct("recipient_email");
+  const sentSet = new Set(sentTo.map((e) => e.toLowerCase()));
+
+  const pendingSubscribers = subscribers.filter((sub) => !sentSet.has(sub.email.toLowerCase()));
+
+  if (pendingSubscribers.length === 0) {
+    claimed.whatsapp_dispatch_status = "sent";
+    await claimed.save();
+    return { status: "sent" };
+  }
+
+  const BATCH_LIMIT = 50;
+  const batch = pendingSubscribers.slice(0, BATCH_LIMIT);
+
+  let sentInBatch = 0;
+  let failedInBatch = 0;
+
+  for (const sub of batch) {
+    if (!sub.whatsapp_number) {
+      failedInBatch++;
+      await EmailEvent.create({
+        campaign_id: claimed._id,
+        recipient_email: sub.email.toLowerCase(),
+        channel: "whatsapp",
+        event_type: "bounce",
+        timestamp: new Date(),
+        details: { error: "No WhatsApp number on file" },
+      });
+      continue;
+    }
+
+    try {
+      const { bodyParams, buttonUrlSuffix } = buildWhatsappTemplateParams(claimed.whatsapp_template as WhatsappTemplateName, {
+        firstName: sub.first_name || "there",
+        webinarTitle: claimed.name,
+        startsAt: claimed.scheduled_at || claimed.created_at || new Date(),
+        timezone: "Asia/Kolkata",
+      });
+
+      const result = await sendWhatsappTemplate({
+        to: sub.whatsapp_number,
+        templateName: claimed.whatsapp_template,
+        bodyParams,
+        buttonUrlSuffix,
+      });
+
+      await EmailEvent.create({
+        campaign_id: claimed._id,
+        recipient_email: sub.email.toLowerCase(),
+        channel: "whatsapp",
+        event_type: "sent",
+        timestamp: new Date(),
+        details: { messageId: result.messageId },
+      });
+
+      sentInBatch++;
+    } catch (err: any) {
+      console.error(`Failed to send campaign WhatsApp message to ${sub.whatsapp_number}:`, err);
+      await EmailEvent.create({
+        campaign_id: claimed._id,
+        recipient_email: sub.email.toLowerCase(),
+        channel: "whatsapp",
+        event_type: "bounce",
+        timestamp: new Date(),
+        details: { error: err.message },
+      });
+      failedInBatch++;
+    }
+  }
+
+  claimed.stats.whatsapp_sent += sentInBatch;
+  claimed.stats.whatsapp_failed += failedInBatch;
+  claimed.whatsapp_dispatch_status = pendingSubscribers.length <= BATCH_LIMIT ? "sent" : "sending";
+  await claimed.save();
+
+  return {
+    status: claimed.whatsapp_dispatch_status,
+    sentCount: sentInBatch,
+    failedCount: failedInBatch,
+    remaining: Math.max(0, pendingSubscribers.length - BATCH_LIMIT),
+  };
 }
 
 /**

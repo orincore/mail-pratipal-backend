@@ -93,10 +93,11 @@ router.get("/click", async (req: Request, res: Response) => {
   const campaignId = req.query.campaignId as string;
   const email = req.query.email as string;
   const url = (req.query.url as string) || "";
+  const channel = (req.query.channel as string) || "email";
 
   const fallbackUrl = "https://pratipal.in";
   const destinationUrl = url ? decodeURIComponent(url) : fallbackUrl;
-  console.log(`[Tracking] Click request received: campaignId=${campaignId}, email=${email}, url=${destinationUrl}`);
+  console.log(`[Tracking] Click request received: campaignId=${campaignId}, email=${email}, url=${destinationUrl}, channel=${channel}`);
 
   try {
     if (campaignId && email) {
@@ -108,6 +109,7 @@ router.get("/click", async (req: Request, res: Response) => {
         campaign_id: campaignId,
         recipient_email: email.toLowerCase(),
         event_type: "click",
+        channel: channel === "whatsapp" ? "whatsapp" : "email",
       });
 
       // 1. Log detailed click event in database
@@ -115,6 +117,7 @@ router.get("/click", async (req: Request, res: Response) => {
         campaign_id: campaignId,
         recipient_email: email.toLowerCase(),
         event_type: "click",
+        channel: channel === "whatsapp" ? "whatsapp" : "email",
         link_url: destinationUrl,
         ip_address: ipAddress,
         user_agent: userAgent,
