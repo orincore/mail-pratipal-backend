@@ -36,7 +36,7 @@ export function prepareEmailHtml({
   const replacements: Record<string, string> = {
     "{{name}}": name,
     "{{first_name}}": firstName,
-    "{{email}}": subscriber.email,
+    "{{email}}": subscriber.email || "",
     "{{company}}": (subscriber.metadata?.get("company") as string) || "Pratipal",
     "{{webinar}}": (subscriber.metadata?.get("webinar") as string) || "Upcoming Webinar",
     "{{date}}": new Date().toLocaleDateString("en-IN", { dateStyle: "long" }),
@@ -60,7 +60,7 @@ export function prepareEmailHtml({
       }
       
       const trackingClickUrl = `${trackingUrl}/api/track/click?campaignId=${campaignId}&email=${encodeURIComponent(
-        subscriber.email
+        subscriber.email || ""
       )}&url=${encodeURIComponent(url)}`;
       
       return match.replace(url, trackingClickUrl);
@@ -70,7 +70,7 @@ export function prepareEmailHtml({
   // 3. Unsubscribe Link Injection/Parsing
   // Ensure unsubscribe tags like {{unsubscribe}} are replaced
   const unsubscribeUrl = `${trackingUrl}/unsubscribe?email=${encodeURIComponent(
-    subscriber.email
+    subscriber.email || ""
   )}&campaignId=${campaignId}`;
 
   if (parsedHtml.includes("{{unsubscribe}}")) {
@@ -93,7 +93,7 @@ export function prepareEmailHtml({
   // 4. Open Tracking Pixel Injection (1x1 transparent image)
   if (trackingEnabled.opens) {
     const trackingPixelUrl = `${trackingUrl}/api/track/open?campaignId=${campaignId}&email=${encodeURIComponent(
-      subscriber.email
+      subscriber.email || ""
     )}`;
     
     const pixelImg = `<img src="${trackingPixelUrl}" width="1" height="1" style="display:none; width:0px; height:0px; border:0;" alt="" />`;
@@ -121,7 +121,7 @@ export function replaceMergeTags(text: string, subscriber: IEmailSubscriber): st
   const replacements: Record<string, string> = {
     "{{name}}": name,
     "{{first_name}}": firstName,
-    "{{email}}": subscriber.email,
+    "{{email}}": subscriber.email || "",
     "{{company}}": (subscriber.metadata?.get("company") as string) || "Pratipal",
     "{{webinar}}": (subscriber.metadata?.get("webinar") as string) || "Upcoming Webinar",
     "{{date}}": new Date().toLocaleDateString("en-IN", { dateStyle: "long" }),

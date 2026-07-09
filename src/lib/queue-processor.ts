@@ -253,6 +253,8 @@ async function sendWhatsappLegForCampaign(campaign: any) {
     }
     
     if (matchCriteria.length > 0) {
+      audienceQuery["$or"] = matchCriteria;
+    } else {
       claimed.whatsapp_dispatch_status = "sent";
       await claimed.save();
       return { status: "sent", message: "Empty audience" };

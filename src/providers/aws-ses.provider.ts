@@ -82,7 +82,7 @@ export class AWSEmailProvider implements EmailProvider {
       const command = new GetEmailIdentityCommand({ EmailIdentity: domain });
       const response = await this.client.send(command);
       
-      const verified = response.Verified;
+      const verified = response.VerifiedForSendingStatus;
       const dkimStatus = response.DkimAttributes?.Status;
 
       const mapStatus = (isVerified: boolean, status?: string): "Pending" | "Success" | "Failed" | "NotFound" => {
@@ -112,7 +112,7 @@ export class AWSEmailProvider implements EmailProvider {
     try {
       const command = new GetEmailIdentityCommand({ EmailIdentity: email });
       const response = await this.client.send(command);
-      return response.Verified ? "Success" : "Pending";
+      return response.VerifiedForSendingStatus ? "Success" : "Pending";
     } catch (error: any) {
       if (error.name === "NotFoundException") {
         return "NotFound";

@@ -58,24 +58,27 @@ router.get("/", async (req: AuthenticatedRequest, res: Response) => {
 // POST /api/subscribers - Create subscriber
 router.post("/", async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const { email, first_name, last_name, status = "subscribed", lists = [], tags = [], metadata = {} } = req.body;
+    const { email, first_name, last_name, whatsapp_number, status = "subscribed", lists = [], tags = [], metadata = {} } = req.body;
 
-    if (!email) {
-      return res.status(400).json({ error: "Email is required" });
+    if (!email && !whatsapp_number) {
+      return res.status(400).json({ error: "Either Email or WhatsApp number is required" });
     }
 
-    const cleanEmail = email.toLowerCase().trim();
-
-    // Check if email already exists
-    const exists = await EmailSubscriber.exists({ email: cleanEmail });
-    if (exists) {
-      return res.status(400).json({ error: "Subscriber email already exists" });
+    let cleanEmail = undefined;
+    if (email) {
+      cleanEmail = email.toLowerCase().trim();
+      // Check if email already exists
+      const exists = await EmailSubscriber.exists({ email: cleanEmail });
+      if (exists) {
+        return res.status(400).json({ error: "Subscriber email already exists" });
+      }
     }
 
     const subscriber = await EmailSubscriber.create({
       email: cleanEmail,
       first_name,
       last_name,
+      whatsapp_number,
       status,
       lists,
       tags,
