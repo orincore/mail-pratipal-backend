@@ -52,6 +52,14 @@ app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 app.use(cookieParser());
 
+// Disable caching for all API routes to ensure real-time MongoDB data
+app.use((req, res, next) => {
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+  next();
+});
+
 // 3. Mount API Endpoints (matching Next.js patterns exactly)
 app.use("/api/track", trackingRouter); // mounts /open and /click -> /api/track/open & /api/track/click
 app.use("/api/unsubscribe", unsubscribeRouter);
