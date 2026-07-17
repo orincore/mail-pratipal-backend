@@ -97,7 +97,11 @@ router.get("/", async (req: AuthenticatedRequest, res: Response) => {
 
 // GET /api/campaigns/meta/whatsapp-templates - MSG91-synced templates for admin UI
 router.get("/meta/whatsapp-templates", async (_req: AuthenticatedRequest, res: Response) => {
-  const templates = await getMergedWhatsappTemplates();
+  // Reminder-only templates (webinar_starting_soon/webinar_live_now) need a
+  // real Webinar to build their "Join Webinar" button link from — campaigns
+  // have no webinar context, so offering them here would let an admin save
+  // a campaign whose WhatsApp send Meta rejects outright at dispatch time.
+  const templates = (await getMergedWhatsappTemplates()).filter((t) => !t.reminderOnly);
   return res.json({ templates, defaultForPreset: DEFAULT_WHATSAPP_TEMPLATE_FOR_PRESET });
 });
 
@@ -137,7 +141,9 @@ router.post("/", async (req: AuthenticatedRequest, res: Response) => {
     let resolvedWhatsappTemplate: string | undefined = whatsapp_template;
     if (!isDraft && resolvedChannel !== "email") {
       const templates = await getMergedWhatsappTemplates();
-      const valid = templates.some((t) => t.supported && t.name === resolvedWhatsappTemplate);
+      // reminderOnly templates need a real Webinar to link to — never valid
+      // for a campaign, which has no webinar context (see meta endpoint above).
+      const valid = templates.some((t) => t.supported && !t.reminderOnly && t.name === resolvedWhatsappTemplate);
       if (!valid) {
         return res.status(400).json({ error: "A valid whatsapp_template is required for the WhatsApp channel" });
       }

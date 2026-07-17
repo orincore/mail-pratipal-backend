@@ -14,27 +14,32 @@ default).
 
 Language: English (`en`) unless a Hindi variant is separately approved later.
 
-**Join-link button — currently STATIC, not per-webinar.** The "Join Webinar"
-button on `webinar_starting_soon`/`webinar_live_now` was switched in MSG91 from
-a dynamic URL (base + `{{1}}` suffix) to a fully static URL. That fixed an
-earlier bug where the literal text `{{1}}` was leaking into the sent link
-(someone had pasted the dynamic-URL example into the button's URL field as
-plain text instead of configuring it as a variable). The tradeoff: the button
-now sends every recipient, for every webinar, to the exact same fixed URL —
-it can no longer point at that person's specific session. Code reflects this:
-`buildWhatsappTemplateParams()` no longer returns a `buttonUrlSuffix` for
-these two templates (attaching one to a now-parameter-less button makes
-Meta's Cloud API reject the send outright).
+**Join-link button — restored to dynamic, pending MSG91/Meta approval.** The
+"Join Webinar" button on `webinar_starting_soon`/`webinar_live_now` was
+previously switched in MSG91 from a dynamic URL (base + `{{1}}` suffix) to a
+fully static URL, as a fix for an earlier bug where the literal text `{{1}}`
+was leaking into the sent link (someone had pasted the dynamic-URL example
+into the button's URL field as plain text instead of configuring it as a
+variable). That masked the real problem instead of fixing it: every
+recipient, for every webinar, got the exact same fixed URL.
 
-To restore a real per-webinar WhatsApp link, one of:
-- Revert the button in MSG91 back to a dynamic URL — base
-  `https://pratipal.in/webinar/join/` (no `{{1}}` typed in as literal text),
-  suffix marked as the variable. `joinSuffix` (`Webinar._id`) is already wired
-  at every call site for this, so it's a one-line restore in
-  `buildWhatsappTemplateParams()` (see `whatsapp-templates.ts` comment).
-- Or submit a template edit adding the full join URL as its own body `{{n}}`
-  variable (body text can vary per-send even when the button can't) and wait
-  for re-approval, then add it to `bodyParams` in `buildWhatsappTemplateParams()`.
+`buildWhatsappTemplateParams()` now returns `buttonUrlSuffix: joinSuffix`
+(`Webinar._id`) for both templates again — **but this requires the button in
+MSG91 to actually be reconfigured as a Dynamic URL and re-approved by Meta
+first**, or every send of these two templates will be rejected outright (a
+filled parameter on a template whose button has no variable slot is an
+invalid send). Steps in MSG91:
+1. Edit `webinar_starting_soon` / `webinar_live_now`, change the "Join
+   Webinar" button from Static URL to Dynamic URL.
+2. Base URL: `https://pratipal.in/webinar/join/` — let MSG91's own UI
+   generate the `{{1}}` placeholder; do not type `{{1}}` into the field
+   yourself, that's exactly what caused the original bug.
+3. Submit for Meta re-approval and confirm it's live before relying on these
+   sends in production.
+
+If the button is ever reverted to fully static again, remove
+`buttonUrlSuffix` from those two cases in `buildWhatsappTemplateParams()`
+(see the comment there).
 
 Email does not have this limitation — the "Join Webinar Session" button in
 the Webinar Reminder email template uses the `{{join_link}}` merge tag
@@ -114,7 +119,7 @@ Hi {{1}}, your webinar *{{2}}* is starting in 30 minutes. Tap the button below t
 | `{{1}}` | First name | registrant record |
 | `{{2}}` | Webinar title | `Webinar.title` |
 
-**Buttons:** 1 URL button — **"Join Webinar"** → static URL (same link for every send; see the note above the template list for why and how to restore per-webinar links)
+**Buttons:** 1 URL button — **"Join Webinar"** → dynamic URL, `https://pratipal.in/webinar/join/<Webinar._id>` (per-recipient — requires the MSG91 button to be configured as Dynamic URL and Meta-approved, see the note above the template list)
 
 ---
 
@@ -132,7 +137,7 @@ Hi {{1}}, your webinar *{{2}}* is starting now. Tap the button below to join rig
 | `{{1}}` | First name | registrant record |
 | `{{2}}` | Webinar title | `Webinar.title` |
 
-**Buttons:** 1 URL button — **"Join Webinar"** → static URL (same link for every send; see the note above the template list for why and how to restore per-webinar links)
+**Buttons:** 1 URL button — **"Join Webinar"** → dynamic URL, `https://pratipal.in/webinar/join/<Webinar._id>` (per-recipient — requires the MSG91 button to be configured as Dynamic URL and Meta-approved, see the note above the template list)
 
 ---
 

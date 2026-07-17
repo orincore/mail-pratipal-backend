@@ -27,6 +27,15 @@ export interface WhatsappTemplateDef {
   label: string;
   description: string;
   hasButton: boolean;
+  /**
+   * True for templates whose button needs a real per-webinar joinSuffix
+   * (Webinar._id) to send successfully. Only the reminder-sweep and
+   * reminder test-send paths have an actual Webinar to supply that from —
+   * generic Campaigns and the standalone test-send endpoint have no webinar
+   * context, so these must be excluded from those pickers/validation or
+   * Meta will reject the send outright (missing required button parameter).
+   */
+  reminderOnly?: boolean;
 }
 
 export const WHATSAPP_TEMPLATES: WhatsappTemplateDef[] = [
@@ -39,14 +48,16 @@ export const WHATSAPP_TEMPLATES: WhatsappTemplateDef[] = [
   {
     name: "webinar_starting_soon",
     label: "Starting Soon (30 min before)",
-    description: "For the 30-minutes-before reminder. Includes a \"Join Webinar\" button — currently a static URL, same link for every webinar (not per-recipient).",
+    description: "For the 30-minutes-before reminder only. Includes a \"Join Webinar\" button linking to that recipient's specific session (requires the button to be a Dynamic URL in MSG91 — see docs/whatsapp-templates.md). Not available for general campaigns — there's no specific webinar to link to outside a reminder.",
     hasButton: true,
+    reminderOnly: true,
   },
   {
     name: "webinar_live_now",
     label: "Live Now (at start)",
-    description: "For the at-start reminder. Includes a \"Join Webinar\" button — currently a static URL, same link for every webinar (not per-recipient).",
+    description: "For the at-start reminder only. Includes a \"Join Webinar\" button linking to that recipient's specific session (requires the button to be a Dynamic URL in MSG91 — see docs/whatsapp-templates.md). Not available for general campaigns — there's no specific webinar to link to outside a reminder.",
     hasButton: true,
+    reminderOnly: true,
   },
   {
     name: "event_notify",
@@ -91,14 +102,14 @@ export interface WhatsappTemplateData {
   relativeTimePhrase?: string;
   originalDate?: Date;
   /**
-   * Webinar._id. Currently UNUSED by buildWhatsappTemplateParams — the
-   * "Join Webinar" button on webinar_starting_soon/webinar_live_now was
-   * changed from a dynamic to a static URL in MSG91, so there's no longer
-   * a per-send suffix slot to fill. Left wired at call sites (queue-processor.ts,
-   * routes/webinars.ts) so restoring a real per-webinar link is a one-line
-   * change here if the button is ever switched back to dynamic, or if the
-   * approved body text is amended to include the full join URL as its own
-   * {{n}} variable instead.
+   * Webinar._id, appended to the "Join Webinar" button's static base URL
+   * (https://pratipal.in/webinar/join/) on webinar_starting_soon/webinar_live_now.
+   * REQUIRES the button to be configured as a Dynamic URL in MSG91 (base +
+   * {{1}} variable, not a fully static link) and Meta-approved — see
+   * docs/whatsapp-templates.md. If the button is ever reverted to fully
+   * static, remove buttonUrlSuffix from those two cases in
+   * buildWhatsappTemplateParams() again, or Meta's Cloud API will reject the
+   * send outright (a filled parameter on a parameter-less button is invalid).
    */
   joinSuffix?: string;
 }
@@ -124,14 +135,13 @@ export function buildWhatsappTemplateParams(
     case "webinar_remind":
       return { bodyParams: [data.firstName, data.webinarTitle, data.relativeTimePhrase || "soon", date, time, data.timezone] };
     case "webinar_starting_soon":
-      // No buttonUrlSuffix: the "Join Webinar" button was switched from a
-      // dynamic to a static URL in MSG91 (fixed link, same for every send).
-      // Meta's Cloud API rejects the whole send if a button_1 component is
-      // attached to a button that has no variable to fill — see joinSuffix
-      // doc comment above for how to restore a real per-webinar link.
-      return { bodyParams: [data.firstName, data.webinarTitle] };
+      // "Join Webinar" button restored to a dynamic URL (base + {{1}}
+      // suffix) in MSG91 — requires the button to actually be configured as
+      // Dynamic URL there (not Static) or Meta's Cloud API will reject the
+      // send outright. See docs/whatsapp-templates.md for the MSG91-side steps.
+      return { bodyParams: [data.firstName, data.webinarTitle], buttonUrlSuffix: data.joinSuffix };
     case "webinar_live_now":
-      return { bodyParams: [data.firstName, data.webinarTitle] };
+      return { bodyParams: [data.firstName, data.webinarTitle], buttonUrlSuffix: data.joinSuffix };
     case "webinar_cancelled":
       return { bodyParams: [data.firstName, data.webinarTitle, data.originalDate ? formatDate(data.originalDate, data.timezone) : date] };
     case "webinar_rescheduled":
