@@ -35,6 +35,14 @@ export const config = {
   jwtSecret: process.env.AUTH_JWT_SECRET || process.env.JWT_SECRET || requiredSecret("AUTH_JWT_SECRET", "fallback-dev-secret"),
   apiKey: requiredSecret("API_KEY", "pratipal-api-key-2026-secure-dev-auth"),
   cronSecret: requiredSecret("CRON_SECRET", "fallback-cron-secret-change-me"),
+  /**
+   * This mail system's own public frontend URL (crm.pratipal.in) — used to
+   * build tracking pixels, click-tracking redirects, and unsubscribe links
+   * embedded in outgoing emails. NOT the NEXT_PUBLIC_APP_URL frontend env
+   * var (that's a separate app's build-time value the backend can't see) —
+   * set APP_URL explicitly in the backend's own .env.
+   */
+  appUrl: process.env.APP_URL || "http://localhost:3001",
   mainWebsite: {
     url: process.env.MAIN_WEBSITE_URL || "http://localhost:3000",
     apiKey: process.env.MAIN_WEBSITE_API_KEY || "",

@@ -493,7 +493,7 @@ router.post("/:id/test-send", async (req: AuthenticatedRequest, res: Response) =
     }
 
     // Parse HTML to inject personalization mock values and the unsubscribe link (tracking disabled)
-    const trackingUrl = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3001";
+    const trackingUrl = config.appUrl;
     const parsedHtml = prepareEmailHtml({
       html: finalHtml,
       subscriber: {

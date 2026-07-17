@@ -2,11 +2,12 @@ import dotenv from "dotenv";
 import path from "path";
 import { connectDB } from "../lib/db";
 import { runQueueSweep } from "../lib/queue-processor";
+import { config } from "../config";
 
 dotenv.config();
 
 const INTERVAL_MS = 10000; // Poll every 10 seconds
-const TRACKING_URL = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3001";
+const TRACKING_URL = config.appUrl;
 
 console.log("=====================================================================");
 console.log("📧 Standalone Node.js Queue Daemon Started");

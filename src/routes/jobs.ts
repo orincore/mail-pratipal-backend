@@ -16,7 +16,7 @@ router.post("/process", async (req: Request, res: Response) => {
   }
 
   try {
-    const trackingUrl = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3001";
+    const trackingUrl = config.appUrl;
     
     // Execute queue processor sweep
     const result = await runQueueSweep(trackingUrl);

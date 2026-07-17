@@ -15,6 +15,7 @@ import {
   type WhatsappTemplateName,
 } from "../lib/whatsapp-templates";
 import { getMergedWhatsappTemplates } from "../lib/whatsapp-template-sync";
+import { config } from "../config";
 
 const router = Router();
 
@@ -390,7 +391,7 @@ router.post("/:id/reminders/:reminderId/test-send", async (req: AuthenticatedReq
       metadata: new Map([["webinar", webinar.title]]),
     } as any;
 
-    const trackingUrl = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3001";
+    const trackingUrl = config.appUrl;
     const parsedHtml = prepareEmailHtml({
       html: finalHtml,
       subscriber: testSubscriber,
