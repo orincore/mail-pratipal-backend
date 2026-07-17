@@ -5,41 +5,18 @@ export interface SendEmailParams {
   subject: string;
   html: string;
   replyTo?: string;
+  /** Extra RFC 5322 headers, e.g. List-Unsubscribe / List-Unsubscribe-Post. */
+  headers?: Record<string, string>;
 }
 
-export interface VerifyDomainResult {
-  verificationToken: string;
-  dkimTokens: string[];
-}
-
-export interface DomainStatusResult {
-  verificationStatus: "Pending" | "Success" | "Failed" | "NotFound";
-  dkimStatus: "Pending" | "Success" | "Failed" | "NotFound";
-}
-
+/**
+ * Sending-only provider abstraction. Identity/domain verification is managed
+ * directly in the provider's console (AWS SES) and is intentionally not part
+ * of this interface.
+ */
 export interface EmailProvider {
   /**
    * Dispatches a single transactional or campaign email
    */
   sendEmail(params: SendEmailParams): Promise<{ messageId: string }>;
-
-  /**
-   * Initiates verification for a custom sending domain (SPF/DKIM tokens)
-   */
-  verifyDomain(domain: string): Promise<VerifyDomainResult>;
-
-  /**
-   * Retrieves the current DNS validation status for a domain from the provider
-   */
-  getDomainVerificationStatus(domain: string): Promise<DomainStatusResult>;
-
-  /**
-   * Triggers a verification email for an individual sender email identity
-   */
-  verifyEmailIdentity(email: string): Promise<void>;
-
-  /**
-   * Returns verification status for a single email address
-   */
-  getEmailIdentityVerificationStatus(email: string): Promise<"Pending" | "Success" | "Failed" | "NotFound">;
 }

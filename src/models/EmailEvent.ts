@@ -2,12 +2,17 @@ import mongoose, { Schema, Document } from "mongoose";
 
 export interface IEmailEvent extends Document {
   campaign_id?: mongoose.Types.ObjectId;
-  automation_id?: mongoose.Types.ObjectId;
   reminder_id?: mongoose.Types.ObjectId;
   recipient_email: string;
   /** Which channel this event belongs to — defaults to "email" for all pre-existing rows. */
   channel: "email" | "whatsapp";
-  event_type: "sent" | "delivered" | "open" | "click" | "bounce" | "complaint" | "unsubscribe";
+  /**
+   * "bounce"/"complaint" are real recipient-side delivery outcomes (from the
+   * SES feedback webhook). "failed" is an infrastructure/send-time failure
+   * (provider error, missing WhatsApp number, throttle exhaustion) — kept
+   * separate so deliverability stats aren't polluted by transient errors.
+   */
+  event_type: "sent" | "delivered" | "open" | "click" | "bounce" | "complaint" | "unsubscribe" | "failed";
   timestamp: Date;
   ip_address?: string;
   user_agent?: string;
@@ -20,13 +25,12 @@ export interface IEmailEvent extends Document {
 const EmailEventSchema = new Schema<IEmailEvent>(
   {
     campaign_id: { type: Schema.Types.ObjectId, ref: "EmailCampaign", index: true },
-    automation_id: { type: Schema.Types.ObjectId, ref: "EmailAutomation", index: true },
     reminder_id: { type: Schema.Types.ObjectId, ref: "WebinarReminder", index: true },
     recipient_email: { type: String, required: true, index: true },
     channel: { type: String, enum: ["email", "whatsapp"], default: "email", index: true },
     event_type: {
       type: String, 
-      enum: ["sent", "delivered", "open", "click", "bounce", "complaint", "unsubscribe"], 
+      enum: ["sent", "delivered", "open", "click", "bounce", "complaint", "unsubscribe", "failed"],
       required: true, 
       index: true 
     },
@@ -53,6 +57,7 @@ const EmailEventSchema = new Schema<IEmailEvent>(
 // High-utility composite indexes for analytics reporting
 EmailEventSchema.index({ campaign_id: 1, event_type: 1 });
 EmailEventSchema.index({ reminder_id: 1, event_type: 1 });
+EmailEventSchema.index({ recipient_email: 1, timestamp: -1 });
 EmailEventSchema.index({ timestamp: -1 });
 
 export default mongoose.models.EmailEvent || mongoose.model<IEmailEvent>("EmailEvent", EmailEventSchema);

@@ -6,6 +6,7 @@ import EmailCampaign from "../models/EmailCampaign";
 import EmailTemplate from "../models/EmailTemplate";
 import WebinarReminder from "../models/WebinarReminder";
 import Webinar from "../models/Webinar";
+import { config } from "../config";
 
 const router = Router();
 
@@ -16,14 +17,15 @@ router.get("/auth/me", async (req: AuthenticatedRequest, res: Response) => {
   return res.json({ user: req.user });
 });
 
-// GET /api/failed-events - Retrieve recent bounce and complaint events with reasons
+// GET /api/failed-events - Retrieve recent bounce/complaint/send-failure events with reasons
 router.get("/failed-events", async (req: AuthenticatedRequest, res: Response) => {
   try {
     const failedEvents = await EmailEvent.find({
-      event_type: { $in: ["bounce", "complaint"] }
+      event_type: { $in: ["bounce", "complaint", "failed"] }
     })
       .sort({ timestamp: -1 })
       .populate("campaign_id", "name")
+      .populate("reminder_id", "name")
       .limit(100);
 
     return res.json(failedEvents);
@@ -61,11 +63,20 @@ router.get("/dashboard-stats", async (req: AuthenticatedRequest, res: Response) 
     const totalClicks = await EmailEvent.countDocuments({ event_type: "click", ...eventQuery });
     const totalBounces = await EmailEvent.countDocuments({ event_type: "bounce", channel: { $ne: "whatsapp" }, ...eventQuery });
     const totalComplaints = await EmailEvent.countDocuments({ event_type: "complaint", ...eventQuery });
+    const totalFailed = await EmailEvent.countDocuments({ event_type: "failed", channel: { $ne: "whatsapp" }, ...eventQuery });
 
-    // WhatsApp specific metrics
+    // WhatsApp specific metrics ("bounce" kept for rows recorded before the failed/bounce split)
     const totalWhatsappSent = await EmailEvent.countDocuments({ event_type: "sent", channel: "whatsapp", ...eventQuery });
-    const totalWhatsappFailed = await EmailEvent.countDocuments({ event_type: "bounce", channel: "whatsapp", ...eventQuery });
+    const totalWhatsappFailed = await EmailEvent.countDocuments({ event_type: { $in: ["bounce", "failed"] }, channel: "whatsapp", ...eventQuery });
     const totalWhatsappOpens = await EmailEvent.countDocuments({ event_type: "open", channel: "whatsapp", ...eventQuery });
+
+    // Rolling 24h SES quota usage for the header gauge
+    const quotaSince = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const quotaUsed = await EmailEvent.countDocuments({
+      event_type: "sent",
+      channel: { $ne: "whatsapp" },
+      timestamp: { $gte: quotaSince },
+    });
 
     const activeSchedules = await EmailCampaign.countDocuments({ status: "scheduled" });
 
@@ -104,7 +115,7 @@ router.get("/dashboard-stats", async (req: AuthenticatedRequest, res: Response) 
         });
 
         const whatsappFailed = await EmailEvent.countDocuments({
-          event_type: "bounce",
+          event_type: { $in: ["bounce", "failed"] },
           channel: "whatsapp",
           timestamp: { $gte: startOfHour, $lte: endOfHour },
         });
@@ -138,7 +149,7 @@ router.get("/dashboard-stats", async (req: AuthenticatedRequest, res: Response) 
         });
 
         const whatsappFailed = await EmailEvent.countDocuments({
-          event_type: "bounce",
+          event_type: { $in: ["bounce", "failed"] },
           channel: "whatsapp",
           timestamp: { $gte: startOfDay, $lte: endOfDay },
         });
@@ -179,7 +190,7 @@ router.get("/dashboard-stats", async (req: AuthenticatedRequest, res: Response) 
         });
 
         const whatsappFailed = await EmailEvent.countDocuments({
-          event_type: "bounce",
+          event_type: { $in: ["bounce", "failed"] },
           channel: "whatsapp",
           timestamp: { $gte: startOfDay, $lte: endOfDay },
         });
@@ -210,6 +221,7 @@ router.get("/dashboard-stats", async (req: AuthenticatedRequest, res: Response) 
       totalClicks,
       totalBounces,
       totalComplaints,
+      totalFailed,
       totalWhatsappSent,
       totalWhatsappFailed,
       totalWhatsappOpens,
@@ -217,6 +229,11 @@ router.get("/dashboard-stats", async (req: AuthenticatedRequest, res: Response) 
       recentCampaigns,
       recentReminders,
       dailyStats,
+      quota: {
+        used24h: quotaUsed,
+        dailyLimit: config.email.dailyQuota,
+        maxSendRatePerSecond: config.email.maxSendRatePerSecond,
+      },
       emailProvider: process.env.EMAIL_PROVIDER || "mock"
     });
   } catch (error: any) {

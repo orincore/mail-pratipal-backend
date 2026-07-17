@@ -23,15 +23,15 @@ async function runWorkerCycle() {
     const result = await runQueueSweep(TRACKING_URL);
     
     const campCount = result.campaigns?.length || 0;
-    const autoCount = result.automations?.length || 0;
-    
-    if (campCount > 0 || autoCount > 0) {
-      console.log(`[${new Date().toLocaleTimeString()}] Drip queue sweep completed:`);
+    const reminderCount = result.webinarReminders?.length || 0;
+
+    if (campCount > 0 || reminderCount > 0) {
+      console.log(`[${new Date().toLocaleTimeString()}] Queue sweep completed:`);
       if (campCount > 0) {
         console.log(`  - Campaigns:`, JSON.stringify(result.campaigns));
       }
-      if (autoCount > 0) {
-        console.log(`  - Automations:`, JSON.stringify(result.automations));
+      if (reminderCount > 0) {
+        console.log(`  - Webinar reminders:`, JSON.stringify(result.webinarReminders));
       }
     }
   } catch (err: any) {

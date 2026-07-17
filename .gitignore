@@ -6,6 +6,8 @@
 
 # environment secrets
 .env
+.env.*
+!.env.example
 
 # debug
 npm-debug.log*

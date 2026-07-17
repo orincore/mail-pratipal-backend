@@ -36,6 +36,8 @@ export interface IWebinarReminder extends Document {
     opens: number;
     clicks: number;
     bounces: number;
+    /** Send-time infrastructure failures — distinct from recipient bounces. */
+    failed: number;
     whatsapp_sent: number;
     whatsapp_failed: number;
   };
@@ -80,6 +82,7 @@ const WebinarReminderSchema = new Schema<IWebinarReminder>(
       opens: { type: Number, default: 0 },
       clicks: { type: Number, default: 0 },
       bounces: { type: Number, default: 0 },
+      failed: { type: Number, default: 0 },
       whatsapp_sent: { type: Number, default: 0 },
       whatsapp_failed: { type: Number, default: 0 },
     },

@@ -1,10 +1,5 @@
 import nodemailer from "nodemailer";
-import { 
-  EmailProvider, 
-  SendEmailParams, 
-  VerifyDomainResult, 
-  DomainStatusResult 
-} from "./email-provider.interface";
+import { EmailProvider, SendEmailParams } from "./email-provider.interface";
 
 export class SMTPEmailProvider implements EmailProvider {
   private transporter: nodemailer.Transporter;
@@ -28,8 +23,8 @@ export class SMTPEmailProvider implements EmailProvider {
   }
 
   async sendEmail(params: SendEmailParams): Promise<{ messageId: string }> {
-    const from = params.fromName 
-      ? `"${params.fromName}" <${params.fromEmail}>` 
+    const from = params.fromName
+      ? `"${params.fromName}" <${params.fromEmail}>`
       : params.fromEmail;
 
     const info = await this.transporter.sendMail({
@@ -38,37 +33,9 @@ export class SMTPEmailProvider implements EmailProvider {
       subject: params.subject,
       html: params.html,
       replyTo: params.replyTo,
+      headers: params.headers,
     });
 
     return { messageId: info.messageId || `smtp-msg-${Date.now()}` };
-  }
-
-  async verifyDomain(domain: string): Promise<VerifyDomainResult> {
-    console.log(`SMTP: Initiating mock domain verification for domain: ${domain}`);
-    return {
-      verificationToken: `smtp-verification-token-${domain}-${Math.random().toString(36).substring(2, 8)}`,
-      dkimTokens: [
-        `smtp-dkim-1.${domain}`,
-        `smtp-dkim-2.${domain}`,
-        `smtp-dkim-3.${domain}`,
-      ],
-    };
-  }
-
-  async getDomainVerificationStatus(domain: string): Promise<DomainStatusResult> {
-    console.log(`SMTP: Querying verification status for domain: ${domain}`);
-    return {
-      verificationStatus: "Success",
-      dkimStatus: "Success",
-    };
-  }
-
-  async verifyEmailIdentity(email: string): Promise<void> {
-    console.log(`SMTP: Initiating mock email verification for: ${email}`);
-  }
-
-  async getEmailIdentityVerificationStatus(email: string): Promise<"Pending" | "Success" | "Failed" | "NotFound"> {
-    console.log(`SMTP: Querying verification status for email: ${email}`);
-    return "Success";
   }
 }

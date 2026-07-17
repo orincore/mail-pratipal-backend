@@ -4,17 +4,17 @@ import Webinar from "../models/Webinar";
 import WebinarReminder from "../models/WebinarReminder";
 import EmailSubscriber from "../models/EmailSubscriber";
 import EmailTemplate from "../models/EmailTemplate";
-import { syncWebinarsFromWebsite, syncRegistrantsForWebinar, computeSendAt, webinarTag } from "../lib/webinar-sync";
+import { syncWebinarsFromWebsite, syncRegistrantsForWebinar, computeSendAt, webinarTag, sendLifecycleWhatsapp } from "../lib/webinar-sync";
 import { getEmailProvider } from "../providers/provider-factory";
 import { prepareEmailHtml, replaceMergeTags } from "../lib/tracking-parser";
 import { sendWhatsappTemplate } from "../providers/msg91-whatsapp.provider";
 import {
-  WHATSAPP_TEMPLATES,
   DEFAULT_WHATSAPP_TEMPLATE_FOR_PRESET,
   buildWhatsappTemplateParams,
   describeOffset,
   type WhatsappTemplateName,
 } from "../lib/whatsapp-templates";
+import { getMergedWhatsappTemplates } from "../lib/whatsapp-template-sync";
 
 const router = Router();
 
@@ -32,9 +32,10 @@ async function registrantCount(webinar: { source_window_id: string }) {
   return EmailSubscriber.countDocuments({ tags: webinarTag(webinar) });
 }
 
-// GET /api/webinars/meta/whatsapp-templates - approved MSG91 template metadata for the reminder UI
+// GET /api/webinars/meta/whatsapp-templates - MSG91-synced template metadata for the reminder UI
 router.get("/meta/whatsapp-templates", async (_req: AuthenticatedRequest, res: Response) => {
-  return res.json({ templates: WHATSAPP_TEMPLATES, defaultForPreset: DEFAULT_WHATSAPP_TEMPLATE_FOR_PRESET });
+  const templates = await getMergedWhatsappTemplates();
+  return res.json({ templates, defaultForPreset: DEFAULT_WHATSAPP_TEMPLATE_FOR_PRESET });
 });
 
 // GET /api/webinars - list webinars with live registrant counts + reminders
@@ -117,6 +118,30 @@ router.put("/:id", async (req: AuthenticatedRequest, res: Response) => {
         { webinar_id: webinar._id, dispatch_status: "pending" },
         { $set: { dispatch_status: "skipped" } }
       );
+      // The reminder sweep already defensively skips whatsapp legs for a
+      // cancelled webinar's due reminders (processWebinarReminders), but
+      // update it here too so the DB reflects "skipped" immediately rather
+      // than only once/if that reminder becomes due.
+      await WebinarReminder.updateMany(
+        { webinar_id: webinar._id, whatsapp_dispatch_status: "pending" },
+        { $set: { whatsapp_dispatch_status: "skipped" } }
+      );
+
+      // Notify everyone already registered for this occurrence.
+      const tag = webinarTag(webinar);
+      const subscribers = await EmailSubscriber.find({
+        tags: tag,
+        whatsapp_number: { $exists: true, $ne: null },
+      }).lean();
+      for (const sub of subscribers) {
+        if (!sub.whatsapp_number) continue;
+        await sendLifecycleWhatsapp(
+          "webinar_cancelled",
+          sub.whatsapp_number,
+          { firstName: sub.first_name || "there", webinarTitle: webinar.title, startsAt: webinar.starts_at, timezone: webinar.timezone },
+          sub.email
+        );
+      }
     }
 
     return res.json({ webinar });
@@ -182,7 +207,11 @@ router.post("/:id/reminders", async (req: AuthenticatedRequest, res: Response) =
       if (!resolvedWhatsappTemplate && preset) {
         resolvedWhatsappTemplate = DEFAULT_WHATSAPP_TEMPLATE_FOR_PRESET[preset];
       }
-      if (!resolvedWhatsappTemplate || !WHATSAPP_TEMPLATES.some((t) => t.name === resolvedWhatsappTemplate)) {
+      const availableTemplates = await getMergedWhatsappTemplates();
+      if (
+        !resolvedWhatsappTemplate ||
+        !availableTemplates.some((t) => t.supported && t.name === resolvedWhatsappTemplate)
+      ) {
         return res.status(400).json({ error: "A valid whatsapp_template is required for the WhatsApp channel" });
       }
     }
@@ -253,7 +282,19 @@ router.put("/:id/reminders/:reminderId", async (req: AuthenticatedRequest, res: 
     if (sender_name) reminder.sender_name = sender_name;
     if (sender_email) reminder.sender_email = sender_email;
     if (template_id) reminder.template_id = template_id;
-    if (whatsapp_template) reminder.whatsapp_template = whatsapp_template;
+
+    if (whatsapp_template) {
+      const availableTemplates = await getMergedWhatsappTemplates();
+      if (!availableTemplates.some((t) => t.supported && t.name === whatsapp_template)) {
+        return res.status(400).json({ error: "A valid whatsapp_template is required for the WhatsApp channel" });
+      }
+      reminder.whatsapp_template = whatsapp_template;
+    }
+
+    const effectiveChannel = channel || reminder.channel;
+    if (effectiveChannel !== "email" && !reminder.whatsapp_template) {
+      return res.status(400).json({ error: "A valid whatsapp_template is required for the WhatsApp channel" });
+    }
 
     if (channel && channel !== reminder.channel) {
       if (!["email", "whatsapp", "both"].includes(channel)) {
@@ -353,7 +394,7 @@ router.post("/:id/reminders/:reminderId/test-send", async (req: AuthenticatedReq
     const parsedHtml = prepareEmailHtml({
       html: finalHtml,
       subscriber: testSubscriber,
-      campaignId: reminder._id.toString(),
+      source: { type: "reminder", id: reminder._id.toString() },
       trackingUrl,
       trackingEnabled: { opens: false, clicks: false },
     });

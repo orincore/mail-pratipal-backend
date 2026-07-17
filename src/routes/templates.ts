@@ -42,6 +42,31 @@ router.post("/", async (req: AuthenticatedRequest, res: Response) => {
   }
 });
 
+// POST /api/templates/:id/duplicate - Clone an existing template
+router.post("/:id/duplicate", async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { id } = req.params;
+
+    const original = await EmailTemplate.findById(id);
+    if (!original) {
+      return res.status(404).json({ error: "Template not found" });
+    }
+
+    const copy = await EmailTemplate.create({
+      name: `${original.name} (Copy)`,
+      subject: original.subject,
+      html_content: original.html_content,
+      design_json: original.design_json,
+      type: original.type,
+    });
+
+    return res.json({ success: true, template: copy });
+  } catch (error: any) {
+    console.error("Duplicate template error:", error);
+    return res.status(500).json({ error: error.message });
+  }
+});
+
 // PUT /api/templates - Update existing template
 router.put("/", async (req: AuthenticatedRequest, res: Response) => {
   try {

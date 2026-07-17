@@ -8,15 +8,13 @@ import { connectDB } from "./lib/db";
 import campaignsRouter from "./routes/campaigns";
 import templatesRouter from "./routes/templates";
 import subscribersRouter from "./routes/subscribers";
-import settingsRouter from "./routes/settings";
 import testSendRouter from "./routes/test-send";
 import trackingRouter from "./routes/tracking";
 import unsubscribeRouter from "./routes/unsubscribe";
 import jobsRouter from "./routes/jobs";
-import landingPagesRouter from "./routes/landing-pages";
 import dashboardRouter from "./routes/dashboard";
-import webhooksRouter from "./routes/webhooks";
 import webinarsRouter from "./routes/webinars";
+import segmentsRouter from "./routes/segments";
 
 const app = express();
 
@@ -32,17 +30,23 @@ app.use(
     origin: (origin, callback) => {
       // Allow requests with no origin (like mobile apps, curl, or server-to-server calls)
       if (!origin) return callback(null, true);
-      
+
       // Allow localhost connections (port 3000, 3001, etc.)
       if (origin.includes("localhost") || origin.includes("127.0.0.1")) {
         return callback(null, true);
       }
-      
-      // In production, allow pratipal domains
-      if (origin.endsWith(".pratipal.in") || origin === "https://pratipal.in") {
+
+      // Brand-configurable allowed origins (see config.branding.allowedOriginSuffixes)
+      const allowed = config.branding.allowedOriginSuffixes.some(
+        (suffix) => origin === suffix || origin.endsWith(suffix)
+      );
+      if (allowed) {
         return callback(null, true);
       }
-      
+
+      if (process.env.NODE_ENV === "production") {
+        return callback(new Error(`Origin ${origin} is not allowed by CORS`));
+      }
       return callback(null, true); // Allow all for high compatibility in development
     },
     credentials: true,
@@ -63,15 +67,13 @@ app.use((req, res, next) => {
 // 3. Mount API Endpoints (matching Next.js patterns exactly)
 app.use("/api/track", trackingRouter); // mounts /open and /click -> /api/track/open & /api/track/click
 app.use("/api/unsubscribe", unsubscribeRouter);
-app.use("/api/webhooks", webhooksRouter); // mounts /aws-ses -> /api/webhooks/aws-ses
 app.use("/api/campaigns", campaignsRouter);
 app.use("/api/templates", templatesRouter);
 app.use("/api/subscribers", subscribersRouter);
 app.use("/api/test-send", testSendRouter);
 app.use("/api/jobs", jobsRouter);
-app.use("/api/landing-pages", landingPagesRouter);
+app.use("/api/segments", segmentsRouter);
 app.use("/api/webinars", webinarsRouter);
-app.use("/api", settingsRouter); // mounts /domains and /senders -> /api/domains & /api/senders
 app.use("/api", dashboardRouter);
 
 // Standard Health Check

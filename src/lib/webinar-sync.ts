@@ -2,6 +2,25 @@ import Webinar from "../models/Webinar";
 import WebinarReminder from "../models/WebinarReminder";
 import EmailSubscriber from "../models/EmailSubscriber";
 import { config } from "../config";
+import { sendWhatsappTemplate } from "../providers/msg91-whatsapp.provider";
+import { buildWhatsappTemplateParams } from "./whatsapp-templates";
+
+// Shared by the registration-confirmation, cancellation, and reschedule
+// notices below — logs and swallows a send failure for one recipient rather
+// than letting it interrupt the sync loop for everyone else.
+export async function sendLifecycleWhatsapp(
+  templateName: "webinar_registration_confirmation" | "webinar_cancelled" | "webinar_rescheduled",
+  to: string,
+  data: Parameters<typeof buildWhatsappTemplateParams>[1],
+  context: string
+): Promise<void> {
+  try {
+    const { bodyParams, buttonUrlSuffix } = buildWhatsappTemplateParams(templateName, data);
+    await sendWhatsappTemplate({ to, templateName, bodyParams, buttonUrlSuffix });
+  } catch (err) {
+    console.error(`${templateName} WhatsApp send failed (${context}):`, err);
+  }
+}
 
 const SYNC_THROTTLE_MS = 5 * 60 * 1000; // don't hit the main website more than once per 5 min
 let lastWebinarListSyncAt = 0;
@@ -68,7 +87,7 @@ export async function syncWebinarsFromWebsite(force = false): Promise<void> {
           slug: w.slug,
           title: w.title,
           starts_at: newStartsAt,
-          timezone: w.webinar_timezone || "Asia/Kolkata",
+          timezone: w.webinar_timezone || config.branding.timezone,
           registration_start: w.registration_start ? new Date(w.registration_start) : undefined,
           registration_end: w.registration_end ? new Date(w.registration_end) : undefined,
           join_link: w.join_link || undefined,
@@ -94,6 +113,27 @@ export async function syncWebinarsFromWebsite(force = false): Promise<void> {
           reminder.offset_value
         );
         await reminder.save();
+      }
+
+      // Let already-registered attendees know the time moved. Only for a
+      // still-upcoming webinar — a cancelled one gets its own notice
+      // instead (see the PUT /api/webinars/:id route), and a completed one
+      // has nobody left to tell.
+      if (webinar.status === "upcoming") {
+        const tag = webinarTag(webinar);
+        const subscribers = await EmailSubscriber.find({
+          tags: tag,
+          whatsapp_number: { $exists: true, $ne: null },
+        }).lean();
+        for (const sub of subscribers) {
+          if (!sub.whatsapp_number) continue;
+          await sendLifecycleWhatsapp(
+            "webinar_rescheduled",
+            sub.whatsapp_number,
+            { firstName: sub.first_name || "there", webinarTitle: webinar.title, startsAt: newStartsAt, timezone: webinar.timezone },
+            sub.email
+          );
+        }
       }
     }
   }
@@ -142,6 +182,14 @@ export async function syncRegistrantsForWebinar(webinar: any, force = false): Pr
     const email = r.email.toLowerCase();
     currentEmails.add(email);
     const whatsapp_number = normalizeWhatsappNumber(r.whatsapp_number);
+
+    // Detect a genuinely new registrant for *this occurrence* before
+    // upserting — webinarTag() is scoped per window, so someone who
+    // registered for an earlier run of the same webinar (and is already an
+    // EmailSubscriber from that) still counts as new here if they don't
+    // have this window's tag yet.
+    const alreadyRegisteredForThisWindow = await EmailSubscriber.exists({ email, tags: tag });
+
     await EmailSubscriber.findOneAndUpdate(
       { email },
       {
@@ -149,12 +197,26 @@ export async function syncRegistrantsForWebinar(webinar: any, force = false): Pr
         $set: {
           first_name: r.first_name,
           "metadata.webinar": webinar.title,
+          // Powers the {{join_link}} merge tag (tracking-parser.ts) so email
+          // templates can point at this specific occurrence instead of a
+          // hardcoded/static URL. Same redirect page the WhatsApp button's
+          // dynamic suffix targets — see docs/whatsapp-templates.md.
+          "metadata.webinar_join_link": `${config.mainWebsite.url}/webinar/join/${webinar._id}`,
           ...(whatsapp_number ? { whatsapp_number } : {}),
         },
         $addToSet: { tags: tag },
       },
       { upsert: true }
     );
+
+    if (!alreadyRegisteredForThisWindow && whatsapp_number && webinar.status === "upcoming") {
+      await sendLifecycleWhatsapp(
+        "webinar_registration_confirmation",
+        whatsapp_number,
+        { firstName: r.first_name || "there", webinarTitle: webinar.title, startsAt: webinar.starts_at, timezone: webinar.timezone },
+        email
+      );
+    }
   }
 
   await EmailSubscriber.updateMany(

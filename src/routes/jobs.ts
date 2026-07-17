@@ -1,5 +1,6 @@
 import { Router, Request, Response } from "express";
 import { runQueueSweep } from "../lib/queue-processor";
+import { config } from "../config";
 
 const router = Router();
 
@@ -7,10 +8,10 @@ const router = Router();
 router.post("/process", async (req: Request, res: Response) => {
   const authHeader = req.headers["authorization"];
   const token = authHeader ? authHeader.replace("Bearer ", "") : "";
-  const expectedToken = process.env.CRON_SECRET || "fallback-cron-secret-change-me";
 
-  // Enforce validation in production mode
-  if (process.env.NODE_ENV === "production" && token !== expectedToken) {
+  // The cron secret is always enforced — config.ts guarantees a real value
+  // exists in production and provides a dev fallback locally.
+  if (token !== config.cronSecret) {
     return res.status(401).json({ error: "Unauthorized cron process execution request" });
   }
 

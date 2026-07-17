@@ -1,6 +1,7 @@
 import { Router, Response } from "express";
 import { AuthenticatedRequest, authMiddleware } from "../middleware/auth";
 import EmailSubscriber from "../models/EmailSubscriber";
+import EmailEvent from "../models/EmailEvent";
 import mongoose from "mongoose";
 
 const router = Router();
@@ -8,13 +9,17 @@ const router = Router();
 // Apply auth middleware to all routes in this file
 router.use(authMiddleware);
 
-// GET /api/subscribers - List subscribers
+const SUPPRESSED_STATUSES = ["bounced", "complained", "unsubscribed"];
+
+// GET /api/subscribers - List subscribers (paginated)
 router.get("/", async (req: AuthenticatedRequest, res: Response) => {
   try {
     const search = (req.query.search as string) || "";
     const list = (req.query.list as string) || "";
     const tag = (req.query.tag as string) || "";
     const status = (req.query.status as string) || "";
+    const page = Math.max(1, parseInt(req.query.page as string, 10) || 1);
+    const limit = Math.min(200, Math.max(1, parseInt(req.query.limit as string, 10) || 25));
 
     const query: any = {};
 
@@ -38,19 +43,115 @@ router.get("/", async (req: AuthenticatedRequest, res: Response) => {
       query.status = status;
     }
 
-    const subscribers = await EmailSubscriber.find(query).sort({ created_at: -1 });
-    
+    const total = await EmailSubscriber.countDocuments(query);
+    const subscribers = await EmailSubscriber.find(query)
+      .sort({ created_at: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit);
+
     // Aggregate unique lists and tags for filtering UI
     const allLists = await EmailSubscriber.distinct("lists");
     const allTags = await EmailSubscriber.distinct("tags");
 
     return res.json({
       subscribers,
+      total,
+      page,
+      pages: Math.max(1, Math.ceil(total / limit)),
       lists: allLists.filter(Boolean),
       tags: allTags.filter(Boolean),
     });
   } catch (error: any) {
     console.error("GET subscribers error:", error);
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/subscribers/suppressions - Suppressed recipients with their latest failure reason
+router.get("/suppressions", async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const status = (req.query.status as string) || "";
+    const page = Math.max(1, parseInt(req.query.page as string, 10) || 1);
+    const limit = Math.min(200, Math.max(1, parseInt(req.query.limit as string, 10) || 25));
+
+    const query: any = {
+      status: status && SUPPRESSED_STATUSES.includes(status) ? status : { $in: SUPPRESSED_STATUSES },
+    };
+
+    const total = await EmailSubscriber.countDocuments(query);
+    const subscribers = await EmailSubscriber.find(query)
+      .sort({ updated_at: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .lean();
+
+    // Attach each subscriber's latest suppression-relevant event for context
+    const emails = subscribers.map((s: any) => s.email).filter(Boolean);
+    const lastEvents = await EmailEvent.aggregate([
+      {
+        $match: {
+          recipient_email: { $in: emails },
+          event_type: { $in: ["bounce", "complaint", "unsubscribe", "failed"] },
+        },
+      },
+      { $sort: { timestamp: -1 } },
+      {
+        $group: {
+          _id: "$recipient_email",
+          event_type: { $first: "$event_type" },
+          timestamp: { $first: "$timestamp" },
+          details: { $first: "$details" },
+        },
+      },
+    ]);
+    const eventByEmail = new Map(lastEvents.map((e: any) => [e._id, e]));
+
+    const counts = await EmailSubscriber.aggregate([
+      { $match: { status: { $in: SUPPRESSED_STATUSES } } },
+      { $group: { _id: "$status", count: { $sum: 1 } } },
+    ]);
+    const countByStatus: Record<string, number> = { bounced: 0, complained: 0, unsubscribed: 0 };
+    for (const row of counts) countByStatus[row._id] = row.count;
+
+    return res.json({
+      subscribers: subscribers.map((s: any) => ({
+        ...s,
+        id: s._id.toString(),
+        last_event: eventByEmail.get(s.email) || null,
+      })),
+      counts: countByStatus,
+      total,
+      page,
+      pages: Math.max(1, Math.ceil(total / limit)),
+    });
+  } catch (error: any) {
+    console.error("GET suppressions error:", error);
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/subscribers/suppressions/reactivate - Move a suppressed contact back to subscribed
+router.post("/suppressions/reactivate", async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { id } = req.body;
+    if (!id || !mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ error: "Subscriber ID is required" });
+    }
+
+    const subscriber = await EmailSubscriber.findById(id);
+    if (!subscriber) {
+      return res.status(404).json({ error: "Subscriber not found" });
+    }
+    if (!SUPPRESSED_STATUSES.includes(subscriber.status)) {
+      return res.status(400).json({ error: "Subscriber is not suppressed" });
+    }
+
+    subscriber.status = "subscribed";
+    await subscriber.save();
+
+    return res.json({ success: true, subscriber });
+  } catch (error: any) {
+    console.error("POST reactivate error:", error);
     return res.status(500).json({ error: error.message });
   }
 });
@@ -107,7 +208,7 @@ router.put("/", async (req: AuthenticatedRequest, res: Response) => {
 
     const subscriber = await EmailSubscriber.findByIdAndUpdate(id, updateFields, { new: true });
     if (!subscriber) {
-      return res.status(444).json({ error: "Subscriber not found" });
+      return res.status(404).json({ error: "Subscriber not found" });
     }
 
     return res.json({ success: true, subscriber });
@@ -158,10 +259,10 @@ router.post("/import", async (req: AuthenticatedRequest, res: Response) => {
       const email = sub.email.toLowerCase().trim();
       const first_name = sub.first_name || sub.firstName || "";
       const last_name = sub.last_name || sub.lastName || "";
-      
+
       const rowLists = Array.isArray(sub.lists) ? sub.lists : (sub.lists ? [sub.lists] : []);
       const rowTags = Array.isArray(sub.tags) ? sub.tags : (sub.tags ? [sub.tags] : []);
-      
+
       const combinedLists = Array.from(new Set([...rowLists, ...defaultLists])).filter(Boolean);
       const combinedTags = Array.from(new Set([...rowTags, ...defaultTags])).filter(Boolean);
 
@@ -267,6 +368,71 @@ router.post("/sync-customers", async (req: AuthenticatedRequest, res: Response) 
     });
   } catch (error: any) {
     console.error("Sync customers API error:", error);
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/subscribers/:id - Single subscriber profile
+router.get("/:id", async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ error: "Invalid subscriber ID" });
+    }
+
+    const subscriber = await EmailSubscriber.findById(id);
+    if (!subscriber) {
+      return res.status(404).json({ error: "Subscriber not found" });
+    }
+
+    return res.json({ subscriber });
+  } catch (error: any) {
+    console.error("GET subscriber error:", error);
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/subscribers/:id/activity - Paginated event history for one subscriber
+router.get("/:id/activity", async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ error: "Invalid subscriber ID" });
+    }
+
+    const subscriber = await EmailSubscriber.findById(id);
+    if (!subscriber) {
+      return res.status(404).json({ error: "Subscriber not found" });
+    }
+
+    if (!subscriber.email) {
+      return res.json({ subscriber, events: [], total: 0, page: 1, pages: 1 });
+    }
+
+    const page = Math.max(1, parseInt(req.query.page as string, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit as string, 10) || 25));
+    const type = (req.query.type as string) || "";
+
+    const query: any = { recipient_email: subscriber.email.toLowerCase() };
+    if (type) query.event_type = type;
+
+    const total = await EmailEvent.countDocuments(query);
+    const events = await EmailEvent.find(query)
+      .sort({ timestamp: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .populate("campaign_id", "name")
+      .populate("reminder_id", "name");
+
+    return res.json({
+      subscriber,
+      events,
+      total,
+      page,
+      pages: Math.max(1, Math.ceil(total / limit)),
+    });
+  } catch (error: any) {
+    console.error("GET subscriber activity error:", error);
     return res.status(500).json({ error: error.message });
   }
 });

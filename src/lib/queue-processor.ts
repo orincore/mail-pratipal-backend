@@ -1,15 +1,24 @@
 import EmailSubscriber from "../models/EmailSubscriber";
 import EmailCampaign from "../models/EmailCampaign";
 import EmailTemplate from "../models/EmailTemplate";
-import EmailAutomation from "../models/EmailAutomation";
 import EmailEvent from "../models/EmailEvent";
-import Webinar from "../models/Webinar";
+import Segment from "../models/Segment";
 import WebinarReminder from "../models/WebinarReminder";
 import { getEmailProvider } from "../providers/provider-factory";
-import { prepareEmailHtml, replaceMergeTags } from "./tracking-parser";
+import {
+  prepareEmailHtml,
+  replaceMergeTags,
+  buildListUnsubscribeHeaders,
+  TrackingSource,
+} from "./tracking-parser";
+import { buildSubscriberQueryForSegment } from "./segment-query";
+import { sendEmailThrottled, getDailyQuotaRemaining, isTransientSendError } from "./send-throttle";
 import { syncWebinarsFromWebsite, syncRegistrantsForWebinar, webinarTag } from "./webinar-sync";
+import { config } from "../config";
 import { sendWhatsappTemplate } from "../providers/msg91-whatsapp.provider";
 import { buildWhatsappTemplateParams, describeOffset, type WhatsappTemplateName } from "./whatsapp-templates";
+
+const BATCH_LIMIT = 50;
 
 /**
  * Executes a full queue processing sweep.
@@ -18,15 +27,82 @@ export async function runQueueSweep(trackingUrl: string) {
   const provider = getEmailProvider();
 
   const campaignResults = await processCampaigns(provider, trackingUrl);
-  const automationResults = await processAutomations(provider, trackingUrl);
   const webinarReminderResults = await processWebinarReminders(provider, trackingUrl);
 
   return {
     campaigns: campaignResults,
-    automations: automationResults,
-    webinarReminders: webinarReminderResults
+    webinarReminders: webinarReminderResults,
   };
 }
+
+// ==========================================================================
+// Audience + A/B helpers
+// ==========================================================================
+
+/**
+ * Resolves a campaign's audience definition to the list of currently
+ * subscribed recipients. Supports "all", lists/tags matching, and saved
+ * segments.
+ */
+async function resolveAudienceSubscribers(audience: any): Promise<any[] | null> {
+  const baseQuery: any = { status: "subscribed" };
+
+  if (audience?.segment_id) {
+    const segment = await Segment.findById(audience.segment_id);
+    if (!segment) {
+      // Segment was deleted after the campaign was created — treat as empty
+      // audience rather than falling back to blasting everyone.
+      return null;
+    }
+    const segmentQuery = await buildSubscriberQueryForSegment(segment);
+    return EmailSubscriber.find({ $and: [baseQuery, segmentQuery] });
+  }
+
+  if (audience?.all) {
+    return EmailSubscriber.find(baseQuery);
+  }
+
+  const matchCriteria = [];
+  if (audience?.lists?.length > 0) {
+    matchCriteria.push({ lists: { $in: audience.lists } });
+  }
+  if (audience?.tags?.length > 0) {
+    matchCriteria.push({ tags: { $in: audience.tags } });
+  }
+
+  if (matchCriteria.length === 0) {
+    return null; // Explicitly empty audience
+  }
+
+  return EmailSubscriber.find({ ...baseQuery, $or: matchCriteria });
+}
+
+/**
+ * Deterministic A/B variant assignment: hashing the email means a recipient
+ * keeps the same variant across resumed batches and campaign re-sweeps.
+ */
+export function abVariantForEmail(email: string, splitPercentage: number): "A" | "B" {
+  let hash = 5381;
+  const input = email.toLowerCase();
+  for (let i = 0; i < input.length; i++) {
+    hash = ((hash << 5) + hash + input.charCodeAt(i)) | 0;
+  }
+  const bucket = Math.abs(hash) % 100;
+  return bucket < splitPercentage ? "A" : "B";
+}
+
+function wrapTextTemplate(html: string, templateType: string): string {
+  if (templateType !== "text") return html;
+  return `
+    <div style="font-family: sans-serif; font-size: 15px; color: #1e293b; white-space: pre-wrap; line-height: 1.6;">
+      ${html}
+    </div>
+  `;
+}
+
+// ==========================================================================
+// Campaigns
+// ==========================================================================
 
 /**
  * Handles batch dispatch of scheduled campaigns.
@@ -35,10 +111,7 @@ async function processCampaigns(provider: any, trackingUrl: string) {
   // Find scheduled campaigns or those in sending state
   const campaigns = await EmailCampaign.find({
     status: { $in: ["scheduled", "sending"] },
-    $or: [
-      { scheduled_at: { $lte: new Date() } },
-      { status: "sending" }
-    ]
+    $or: [{ scheduled_at: { $lte: new Date() } }, { status: "sending" }],
   });
 
   const summary = [];
@@ -94,6 +167,8 @@ async function processCampaigns(provider: any, trackingUrl: string) {
 async function sendEmailLegForCampaign(campaign: any, provider: any, trackingUrl: string) {
   let claimed = campaign;
   if (campaign.dispatch_status === "pending") {
+    // Atomically claim this leg so a concurrent sweep (worker + /api/jobs/process
+    // cron) can't both start dispatching the same first batch.
     const result = await EmailCampaign.findOneAndUpdate(
       { _id: campaign._id, dispatch_status: "pending" },
       { $set: { dispatch_status: "sending" } },
@@ -103,46 +178,39 @@ async function sendEmailLegForCampaign(campaign: any, provider: any, trackingUrl
     claimed = result;
   }
 
-  const template = await EmailTemplate.findById(claimed.template_id);
-  if (!template) {
+  const abEnabled = !!claimed.ab_test?.enabled;
+  const splitPercentage = claimed.ab_test?.split_percentage || 50;
+
+  const templateA = await EmailTemplate.findById(claimed.template_id);
+  if (!templateA) {
     claimed.dispatch_status = "skipped";
     await claimed.save();
     return { status: "skipped", error: "Template not found" };
   }
 
-  // Resolve the target audience
-  const audienceQuery: any = { status: "subscribed" };
-
-  if (!claimed.audience.all) {
-    const matchCriteria = [];
-    if (claimed.audience.lists?.length > 0) {
-      matchCriteria.push({ lists: { $in: claimed.audience.lists } });
-    }
-    if (claimed.audience.tags?.length > 0) {
-      matchCriteria.push({ tags: { $in: claimed.audience.tags } });
-    }
-    
-    if (matchCriteria.length > 0) {
-      audienceQuery["$or"] = matchCriteria;
-    } else {
-      claimed.dispatch_status = "sent";
-      await claimed.save();
-      return { status: "sent", message: "Empty audience" };
-    }
+  // Variant B falls back to variant A's template when only the subject differs.
+  let templateB = templateA;
+  if (abEnabled && claimed.ab_test?.template_id_b) {
+    templateB = (await EmailTemplate.findById(claimed.ab_test.template_id_b)) || templateA;
   }
 
-  const subscribers = await EmailSubscriber.find(audienceQuery);
-  
+  const subscribers = await resolveAudienceSubscribers(claimed.audience);
+  if (subscribers === null) {
+    claimed.dispatch_status = "sent";
+    await claimed.save();
+    return { status: "sent", message: "Empty audience" };
+  }
+
   const sentEmails = await EmailEvent.find({
     campaign_id: claimed._id,
     channel: "email",
-    event_type: "sent"
+    event_type: "sent",
   }).distinct("recipient_email");
 
-  const sentEmailsSet = new Set(sentEmails.map(e => e.toLowerCase()));
+  const sentEmailsSet = new Set(sentEmails.map((e) => e.toLowerCase()));
 
   const pendingSubscribers = subscribers.filter(
-    (sub) => !sentEmailsSet.has(sub.email.toLowerCase())
+    (sub) => sub.email && !sentEmailsSet.has(sub.email.toLowerCase())
   );
 
   if (pendingSubscribers.length === 0) {
@@ -151,38 +219,46 @@ async function sendEmailLegForCampaign(campaign: any, provider: any, trackingUrl
     return { status: "sent" };
   }
 
-  const BATCH_LIMIT = 50;
-  const batch = pendingSubscribers.slice(0, BATCH_LIMIT);
+  // Daily quota guard: never dispatch beyond the rolling 24h SES allowance.
+  // Anything over the line stays pending and resumes on a later sweep.
+  const quotaRemaining = await getDailyQuotaRemaining();
+  if (quotaRemaining <= 0) {
+    console.warn(`Daily email quota exhausted — deferring campaign ${claimed._id} to a later sweep`);
+    return { status: "sending" as const, deferred: true, reason: "daily_quota_exhausted" };
+  }
+
+  const batch = pendingSubscribers.slice(0, Math.min(BATCH_LIMIT, quotaRemaining));
+
+  const source: TrackingSource = { type: "campaign", id: claimed._id.toString() };
 
   let sentInBatch = 0;
   let failedInBatch = 0;
 
   for (const sub of batch) {
+    const variant: "A" | "B" = abEnabled ? abVariantForEmail(sub.email, splitPercentage) : "A";
+    const template = variant === "B" ? templateB : templateA;
+    const subjectSource =
+      variant === "B" && claimed.ab_test?.subject_b ? claimed.ab_test.subject_b : claimed.subject || "";
+
     try {
       const customizedHtml = prepareEmailHtml({
         html: template.html_content || "",
         subscriber: sub,
-        campaignId: claimed._id.toString(),
+        source,
         trackingUrl,
         trackingEnabled: claimed.tracking,
       });
 
-      let finalHtml = customizedHtml;
-      if (template.type === "text") {
-        finalHtml = `
-          <div style="font-family: sans-serif; font-size: 15px; color: #1e293b; white-space: pre-wrap; line-height: 1.6;">
-            ${customizedHtml}
-          </div>
-        `;
-      }
+      const finalHtml = wrapTextTemplate(customizedHtml, template.type);
 
-      const { messageId } = await provider.sendEmail({
+      const { messageId } = await sendEmailThrottled(provider, {
         to: sub.email,
         fromName: claimed.sender_name,
         fromEmail: claimed.sender_email,
-        subject: replaceMergeTags(claimed.subject || "", sub),
+        subject: replaceMergeTags(subjectSource, sub),
         html: finalHtml,
         replyTo: claimed.reply_to,
+        headers: buildListUnsubscribeHeaders(trackingUrl, sub.email, source),
       });
 
       await EmailEvent.create({
@@ -191,7 +267,7 @@ async function sendEmailLegForCampaign(campaign: any, provider: any, trackingUrl
         channel: "email",
         event_type: "sent",
         timestamp: new Date(),
-        details: { messageId }
+        details: abEnabled ? { messageId, variant } : { messageId },
       });
 
       sentInBatch++;
@@ -201,24 +277,25 @@ async function sendEmailLegForCampaign(campaign: any, provider: any, trackingUrl
         campaign_id: claimed._id,
         recipient_email: sub.email.toLowerCase(),
         channel: "email",
-        event_type: "bounce",
+        event_type: "failed",
         timestamp: new Date(),
-        details: { error: err.message }
+        details: { error: err.message, transient: isTransientSendError(err), variant },
       });
       failedInBatch++;
     }
   }
 
   claimed.stats.sent += sentInBatch;
-  claimed.stats.bounces += failedInBatch;
-  claimed.dispatch_status = pendingSubscribers.length <= BATCH_LIMIT ? "sent" : "sending";
+  claimed.stats.failed = (claimed.stats.failed || 0) + failedInBatch;
+  claimed.dispatch_status =
+    pendingSubscribers.length <= batch.length ? "sent" : "sending";
   await claimed.save();
 
   return {
     status: claimed.dispatch_status,
     sentCount: sentInBatch,
     failedCount: failedInBatch,
-    remaining: Math.max(0, pendingSubscribers.length - BATCH_LIMIT),
+    remaining: Math.max(0, pendingSubscribers.length - batch.length),
   };
 }
 
@@ -240,28 +317,12 @@ async function sendWhatsappLegForCampaign(campaign: any) {
     return { status: "skipped", error: "No whatsapp_template set" };
   }
 
-  // Resolve the target audience
-  const audienceQuery: any = { status: "subscribed" };
-
-  if (!claimed.audience.all) {
-    const matchCriteria = [];
-    if (claimed.audience.lists?.length > 0) {
-      matchCriteria.push({ lists: { $in: claimed.audience.lists } });
-    }
-    if (claimed.audience.tags?.length > 0) {
-      matchCriteria.push({ tags: { $in: claimed.audience.tags } });
-    }
-    
-    if (matchCriteria.length > 0) {
-      audienceQuery["$or"] = matchCriteria;
-    } else {
-      claimed.whatsapp_dispatch_status = "sent";
-      await claimed.save();
-      return { status: "sent", message: "Empty audience" };
-    }
+  const subscribers = await resolveAudienceSubscribers(claimed.audience);
+  if (subscribers === null) {
+    claimed.whatsapp_dispatch_status = "sent";
+    await claimed.save();
+    return { status: "sent", message: "Empty audience" };
   }
-
-  const subscribers = await EmailSubscriber.find(audienceQuery);
 
   const sentTo = await EmailEvent.find({
     campaign_id: claimed._id,
@@ -270,7 +331,9 @@ async function sendWhatsappLegForCampaign(campaign: any) {
   }).distinct("recipient_email");
   const sentSet = new Set(sentTo.map((e) => e.toLowerCase()));
 
-  const pendingSubscribers = subscribers.filter((sub) => !sentSet.has(sub.email.toLowerCase()));
+  const pendingSubscribers = subscribers.filter(
+    (sub) => sub.email && !sentSet.has(sub.email.toLowerCase())
+  );
 
   if (pendingSubscribers.length === 0) {
     claimed.whatsapp_dispatch_status = "sent";
@@ -278,7 +341,6 @@ async function sendWhatsappLegForCampaign(campaign: any) {
     return { status: "sent" };
   }
 
-  const BATCH_LIMIT = 50;
   const batch = pendingSubscribers.slice(0, BATCH_LIMIT);
 
   let sentInBatch = 0;
@@ -291,7 +353,7 @@ async function sendWhatsappLegForCampaign(campaign: any) {
         campaign_id: claimed._id,
         recipient_email: sub.email.toLowerCase(),
         channel: "whatsapp",
-        event_type: "bounce",
+        event_type: "failed",
         timestamp: new Date(),
         details: { error: "No WhatsApp number on file" },
       });
@@ -299,12 +361,15 @@ async function sendWhatsappLegForCampaign(campaign: any) {
     }
 
     try {
-      const { bodyParams, buttonUrlSuffix } = buildWhatsappTemplateParams(claimed.whatsapp_template as WhatsappTemplateName, {
-        firstName: sub.first_name || "there",
-        webinarTitle: claimed.name,
-        startsAt: claimed.scheduled_at || claimed.created_at || new Date(),
-        timezone: "Asia/Kolkata",
-      });
+      const { bodyParams, buttonUrlSuffix } = buildWhatsappTemplateParams(
+        claimed.whatsapp_template as WhatsappTemplateName,
+        {
+          firstName: sub.first_name || "there",
+          webinarTitle: claimed.name,
+          startsAt: claimed.scheduled_at || claimed.created_at || new Date(),
+          timezone: config.branding.timezone,
+        }
+      );
 
       const result = await sendWhatsappTemplate({
         to: sub.whatsapp_number,
@@ -329,7 +394,7 @@ async function sendWhatsappLegForCampaign(campaign: any) {
         campaign_id: claimed._id,
         recipient_email: sub.email.toLowerCase(),
         channel: "whatsapp",
-        event_type: "bounce",
+        event_type: "failed",
         timestamp: new Date(),
         details: { error: err.message },
       });
@@ -350,177 +415,13 @@ async function sendWhatsappLegForCampaign(campaign: any) {
   };
 }
 
-/**
- * Handles execution of active drip automation steps.
- */
-async function processAutomations(provider: any, trackingUrl: string) {
-  const automations = await EmailAutomation.find({ status: "active" });
-  const summary = [];
-
-  for (const automation of automations) {
-    const activeEnrollments = automation.enrollments.filter(
-      (enroll: any) => enroll.status === "active" && enroll.next_run_at <= new Date()
-    );
-
-    if (activeEnrollments.length === 0) continue;
-
-    let processedCount = 0;
-
-    for (const enroll of activeEnrollments) {
-      try {
-        const subscriber = await EmailSubscriber.findById(enroll.subscriber_id);
-        if (!subscriber || subscriber.status !== "subscribed") {
-          enroll.status = "completed";
-          continue;
-        }
-
-        const currentStep = automation.steps.find((s: any) => s.id === enroll.current_step_id);
-        if (!currentStep) {
-          enroll.status = "completed";
-          continue;
-        }
-
-        let nextStepId = currentStep.next_step_id;
-        let nextRunAt = new Date();
-
-        if (currentStep.type === "email") {
-          const emailConfig = currentStep.email_config;
-          if (emailConfig) {
-            const template = await EmailTemplate.findById(emailConfig.template_id);
-            if (template) {
-              const customizedHtml = prepareEmailHtml({
-                html: template.html_content || "",
-                subscriber,
-                campaignId: automation._id.toString(),
-                trackingUrl,
-                trackingEnabled: { opens: true, clicks: true },
-              });
-
-              let finalHtml = customizedHtml;
-              if (template.type === "text") {
-                finalHtml = `
-                  <div style="font-family: sans-serif; font-size: 15px; color: #1e293b; white-space: pre-wrap; line-height: 1.6;">
-                    ${customizedHtml}
-                  </div>
-                `;
-              }
-
-              const { messageId } = await provider.sendEmail({
-                to: subscriber.email,
-                fromName: emailConfig.sender_name,
-                fromEmail: emailConfig.sender_email,
-                subject: emailConfig.subject,
-                html: finalHtml,
-              });
-
-              await EmailEvent.create({
-                automation_id: automation._id,
-                recipient_email: subscriber.email.toLowerCase(),
-                event_type: "sent",
-                timestamp: new Date(),
-                details: { messageId, step_id: currentStep.id }
-              });
-
-              enroll.history.push({
-                step_id: currentStep.id,
-                executed_at: new Date(),
-                status: "success",
-              });
-            } else {
-              throw new Error(`Email template not found: ${emailConfig.template_id}`);
-            }
-          }
-        } 
-        else if (currentStep.type === "delay") {
-          const delayConfig = currentStep.delay_config;
-          if (delayConfig) {
-            const now = new Date();
-            let addedMs = 0;
-            if (delayConfig.unit === "minutes") addedMs = delayConfig.duration * 60 * 1000;
-            else if (delayConfig.unit === "hours") addedMs = delayConfig.duration * 60 * 60 * 1000;
-            else if (delayConfig.unit === "days") addedMs = delayConfig.duration * 24 * 60 * 60 * 1000;
-
-            nextRunAt = new Date(now.getTime() + addedMs);
-            enroll.history.push({
-              step_id: currentStep.id,
-              executed_at: new Date(),
-              status: "success",
-              details: `Delayed for ${delayConfig.duration} ${delayConfig.unit}`,
-            });
-          }
-        } 
-        else if (currentStep.type === "condition") {
-          const condition = currentStep.condition_config;
-          let conditionMet = false;
-
-          if (condition) {
-            if (condition.field === "tag") {
-              conditionMet = subscriber.tags.includes(condition.value);
-            } 
-            else if (condition.field === "open") {
-              conditionMet = await EmailEvent.exists({
-                automation_id: automation._id,
-                recipient_email: subscriber.email.toLowerCase(),
-                event_type: "open",
-              }) !== null;
-            } 
-            else if (condition.field === "click") {
-              conditionMet = await EmailEvent.exists({
-                automation_id: automation._id,
-                recipient_email: subscriber.email.toLowerCase(),
-                event_type: "click",
-              }) !== null;
-            }
-
-            nextStepId = conditionMet ? condition.yes_step_id : condition.no_step_id;
-            
-            enroll.history.push({
-              step_id: currentStep.id,
-              executed_at: new Date(),
-              status: "success",
-              details: `Condition checked: met=${conditionMet}`,
-            });
-          }
-        }
-
-        if (nextStepId) {
-          enroll.current_step_id = nextStepId;
-          enroll.next_run_at = nextRunAt;
-        } else {
-          enroll.status = "completed";
-          automation.stats.completed += 1;
-        }
-
-        processedCount++;
-      } catch (err: any) {
-        console.error(`Error processing automation step for subscriber ${enroll.subscriber_id}:`, err);
-        enroll.history.push({
-          step_id: enroll.current_step_id,
-          executed_at: new Date(),
-          status: "failed",
-          details: err.message,
-        });
-        
-        enroll.next_run_at = new Date(Date.now() + 5 * 60 * 1000);
-      }
-    }
-
-    await automation.save();
-    summary.push({
-      automationId: automation._id,
-      name: automation.name,
-      processedEnrollments: processedCount,
-    });
-  }
-
-  return summary;
-}
+// ==========================================================================
+// Webinar reminders
+// ==========================================================================
 
 /**
  * Handles dispatch of due webinar reminder emails.
  */
-const BATCH_LIMIT = 50;
-
 async function processWebinarReminders(provider: any, trackingUrl: string) {
   await syncWebinarsFromWebsite();
 
@@ -541,7 +442,8 @@ async function processWebinarReminders(provider: any, trackingUrl: string) {
 
     if (webinar.status === "cancelled") {
       if (["pending", "sending"].includes(reminder.dispatch_status)) reminder.dispatch_status = "skipped";
-      if (["pending", "sending"].includes(reminder.whatsapp_dispatch_status)) reminder.whatsapp_dispatch_status = "skipped";
+      if (["pending", "sending"].includes(reminder.whatsapp_dispatch_status))
+        reminder.whatsapp_dispatch_status = "skipped";
       await reminder.save();
       summary.push({ reminderId: reminder._id, status: "skipped", reason: "Webinar cancelled" });
       continue;
@@ -598,7 +500,9 @@ async function sendEmailLegForReminder(reminder: any, webinar: any, tag: string,
   }).distinct("recipient_email");
   const sentEmailsSet = new Set(sentEmails.map((e) => e.toLowerCase()));
 
-  const pendingSubscribers = subscribers.filter((sub) => !sentEmailsSet.has(sub.email.toLowerCase()));
+  const pendingSubscribers = subscribers.filter(
+    (sub) => sub.email && !sentEmailsSet.has(sub.email.toLowerCase())
+  );
 
   if (pendingSubscribers.length === 0) {
     claimed.dispatch_status = "sent";
@@ -606,7 +510,16 @@ async function sendEmailLegForReminder(reminder: any, webinar: any, tag: string,
     return { reminderId: claimed._id, channel: "email", status: "sent", message: "Empty audience" };
   }
 
-  const batch = pendingSubscribers.slice(0, BATCH_LIMIT);
+  // Daily quota guard — same rolling window shared with campaigns.
+  const quotaRemaining = await getDailyQuotaRemaining();
+  if (quotaRemaining <= 0) {
+    console.warn(`Daily email quota exhausted — deferring reminder ${claimed._id} to a later sweep`);
+    return { reminderId: claimed._id, channel: "email", status: "sending", deferred: true };
+  }
+
+  const batch = pendingSubscribers.slice(0, Math.min(BATCH_LIMIT, quotaRemaining));
+
+  const source: TrackingSource = { type: "reminder", id: claimed._id.toString() };
 
   let sentInBatch = 0;
   let failedInBatch = 0;
@@ -616,26 +529,20 @@ async function sendEmailLegForReminder(reminder: any, webinar: any, tag: string,
       const customizedHtml = prepareEmailHtml({
         html: template.html_content || "",
         subscriber: sub,
-        campaignId: claimed._id.toString(),
+        source,
         trackingUrl,
         trackingEnabled: { opens: true, clicks: true },
       });
 
-      let finalHtml = customizedHtml;
-      if (template.type === "text") {
-        finalHtml = `
-          <div style="font-family: sans-serif; font-size: 15px; color: #1e293b; white-space: pre-wrap; line-height: 1.6;">
-            ${customizedHtml}
-          </div>
-        `;
-      }
+      const finalHtml = wrapTextTemplate(customizedHtml, template.type);
 
-      const { messageId } = await provider.sendEmail({
+      const { messageId } = await sendEmailThrottled(provider, {
         to: sub.email,
         fromName: claimed.sender_name,
         fromEmail: claimed.sender_email,
         subject: replaceMergeTags(claimed.subject, sub),
         html: finalHtml,
+        headers: buildListUnsubscribeHeaders(trackingUrl, sub.email, source),
       });
 
       await EmailEvent.create({
@@ -654,17 +561,17 @@ async function sendEmailLegForReminder(reminder: any, webinar: any, tag: string,
         reminder_id: claimed._id,
         recipient_email: sub.email.toLowerCase(),
         channel: "email",
-        event_type: "bounce",
+        event_type: "failed",
         timestamp: new Date(),
-        details: { error: err.message },
+        details: { error: err.message, transient: isTransientSendError(err) },
       });
       failedInBatch++;
     }
   }
 
   claimed.stats.sent += sentInBatch;
-  claimed.stats.bounces += failedInBatch;
-  claimed.dispatch_status = pendingSubscribers.length <= BATCH_LIMIT ? "sent" : "sending";
+  claimed.stats.failed = (claimed.stats.failed || 0) + failedInBatch;
+  claimed.dispatch_status = pendingSubscribers.length <= batch.length ? "sent" : "sending";
   await claimed.save();
 
   return {
@@ -673,7 +580,7 @@ async function sendEmailLegForReminder(reminder: any, webinar: any, tag: string,
     status: claimed.dispatch_status,
     sentCount: sentInBatch,
     failedCount: failedInBatch,
-    remaining: Math.max(0, pendingSubscribers.length - BATCH_LIMIT),
+    remaining: Math.max(0, pendingSubscribers.length - batch.length),
   };
 }
 
@@ -704,7 +611,9 @@ async function sendWhatsappLegForReminder(reminder: any, webinar: any, tag: stri
   }).distinct("recipient_email");
   const sentSet = new Set(sentTo.map((e) => e.toLowerCase()));
 
-  const pendingSubscribers = subscribers.filter((sub) => !sentSet.has(sub.email.toLowerCase()));
+  const pendingSubscribers = subscribers.filter(
+    (sub) => sub.email && !sentSet.has(sub.email.toLowerCase())
+  );
 
   if (pendingSubscribers.length === 0) {
     claimed.whatsapp_dispatch_status = "sent";
@@ -725,7 +634,7 @@ async function sendWhatsappLegForReminder(reminder: any, webinar: any, tag: stri
         reminder_id: claimed._id,
         recipient_email: sub.email.toLowerCase(),
         channel: "whatsapp",
-        event_type: "bounce",
+        event_type: "failed",
         timestamp: new Date(),
         details: { error: "No WhatsApp number on file" },
       });
@@ -733,14 +642,17 @@ async function sendWhatsappLegForReminder(reminder: any, webinar: any, tag: stri
     }
 
     try {
-      const { bodyParams, buttonUrlSuffix } = buildWhatsappTemplateParams(claimed.whatsapp_template as WhatsappTemplateName, {
-        firstName: sub.first_name || "there",
-        webinarTitle: webinar.title,
-        startsAt: webinar.starts_at,
-        timezone: webinar.timezone,
-        relativeTimePhrase: relativePhrase,
-        joinSuffix: webinar._id.toString(),
-      });
+      const { bodyParams, buttonUrlSuffix } = buildWhatsappTemplateParams(
+        claimed.whatsapp_template as WhatsappTemplateName,
+        {
+          firstName: sub.first_name || "there",
+          webinarTitle: webinar.title,
+          startsAt: webinar.starts_at,
+          timezone: webinar.timezone,
+          relativeTimePhrase: relativePhrase,
+          joinSuffix: webinar._id.toString(),
+        }
+      );
 
       const result = await sendWhatsappTemplate({
         to: sub.whatsapp_number,
@@ -765,7 +677,7 @@ async function sendWhatsappLegForReminder(reminder: any, webinar: any, tag: stri
         reminder_id: claimed._id,
         recipient_email: sub.email.toLowerCase(),
         channel: "whatsapp",
-        event_type: "bounce",
+        event_type: "failed",
         timestamp: new Date(),
         details: { error: err.message },
       });

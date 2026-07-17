@@ -4,6 +4,7 @@ import { getEmailProvider } from "../providers/provider-factory";
 import { prepareEmailHtml, replaceMergeTags } from "../lib/tracking-parser";
 import { sendWhatsappTemplate } from "../providers/msg91-whatsapp.provider";
 import { buildWhatsappTemplateParams, type WhatsappTemplateName } from "../lib/whatsapp-templates";
+import { config } from "../config";
 
 const router = Router();
 
@@ -23,7 +24,7 @@ router.post("/whatsapp", async (req: AuthenticatedRequest, res: Response) => {
       firstName: "Test Recipient",
       webinarTitle: eventName,
       startsAt: new Date(),
-      timezone: "Asia/Kolkata",
+      timezone: config.branding.timezone,
     });
 
     console.log(`Test WhatsApp Send: Dispatching test message to ${to}`);
@@ -49,7 +50,11 @@ router.post("/whatsapp", async (req: AuthenticatedRequest, res: Response) => {
 // POST /api/test-send - Dispatch test email
 router.post("/", async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const { to, subject, html, fromName = "Pratipal", fromEmail = "contact@notifications.pratipal.in" } = req.body;
+    const { to, subject, html, fromName = config.branding.name, fromEmail = process.env.DEFAULT_SENDER_EMAIL || "" } = req.body;
+
+    if (!fromEmail) {
+      return res.status(400).json({ error: "fromEmail is required (or set DEFAULT_SENDER_EMAIL)" });
+    }
 
     if (!to || !subject || !html) {
       return res.status(400).json({ error: "Required fields (to, subject, html) are missing" });
@@ -66,14 +71,16 @@ router.post("/", async (req: AuthenticatedRequest, res: Response) => {
       status: "subscribed",
       metadata: new Map([
         ["webinar", "Upcoming Webinar"],
-        ["company", "Pratipal"]
+        ["company", config.branding.name]
       ]),
     } as any;
 
     const parsedHtml = prepareEmailHtml({
       html,
       subscriber: mockSubscriber,
-      campaignId: "test-campaign",
+      // Synthetic id: test sends have tracking disabled, so this never
+      // reaches the tracking endpoints — it only keys the unsubscribe URL.
+      source: { type: "campaign", id: "000000000000000000000000" },
       trackingUrl,
       trackingEnabled: { opens: false, clicks: false },
     });

@@ -13,6 +13,19 @@ export interface IEmailCampaign extends Document {
     lists: string[];
     tags: string[];
     all: boolean;
+    segment_id?: mongoose.Types.ObjectId;
+  };
+  /**
+   * A/B subject/template test. When enabled, each recipient is
+   * deterministically assigned variant A or B by hashing their email so
+   * re-runs of the batch processor never flip a recipient's variant.
+   */
+  ab_test?: {
+    enabled: boolean;
+    /** Percentage of the audience receiving variant A (1–99). Remainder gets B. */
+    split_percentage: number;
+    subject_b?: string;
+    template_id_b?: mongoose.Types.ObjectId;
   };
   status: "draft" | "scheduled" | "sending" | "sent" | "paused" | "cancelled";
   dispatch_status: "pending" | "sending" | "sent" | "skipped";
@@ -32,6 +45,8 @@ export interface IEmailCampaign extends Document {
     bounces: number;
     complaints: number;
     unsubscribed: number;
+    /** Send-time infrastructure failures (provider errors) — distinct from real bounces. */
+    failed: number;
     whatsapp_sent: number;
     whatsapp_failed: number;
   };
@@ -53,6 +68,13 @@ const EmailCampaignSchema = new Schema<IEmailCampaign>(
       lists: [{ type: String }],
       tags: [{ type: String }],
       all: { type: Boolean, default: false },
+      segment_id: { type: Schema.Types.ObjectId, ref: "Segment" },
+    },
+    ab_test: {
+      enabled: { type: Boolean, default: false },
+      split_percentage: { type: Number, default: 50, min: 1, max: 99 },
+      subject_b: { type: String },
+      template_id_b: { type: Schema.Types.ObjectId, ref: "EmailTemplate" },
     },
     status: { 
       type: String, 
@@ -87,6 +109,7 @@ const EmailCampaignSchema = new Schema<IEmailCampaign>(
       bounces: { type: Number, default: 0 },
       complaints: { type: Number, default: 0 },
       unsubscribed: { type: Number, default: 0 },
+      failed: { type: Number, default: 0 },
       whatsapp_sent: { type: Number, default: 0 },
       whatsapp_failed: { type: Number, default: 0 },
     },

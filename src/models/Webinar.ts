@@ -1,4 +1,5 @@
 import mongoose, { Schema, Document } from "mongoose";
+import { config } from "../config";
 
 // Mirrors one InvitationWindow from the main website — one specific occurrence
 // of a (possibly reused) webinar landing page. Keyed by source_window_id, not
@@ -26,7 +27,7 @@ const WebinarSchema = new Schema<IWebinar>(
     slug: { type: String, required: true, index: true },
     title: { type: String, required: true },
     starts_at: { type: Date, required: true, index: true },
-    timezone: { type: String, default: "Asia/Kolkata" },
+    timezone: { type: String, default: () => config.branding.timezone },
     status: {
       type: String,
       enum: ["upcoming", "completed", "cancelled"],
