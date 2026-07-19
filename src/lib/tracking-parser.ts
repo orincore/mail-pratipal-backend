@@ -87,6 +87,10 @@ export function prepareEmailHtml({
     "{{email}}": recipientEmail,
     "{{company}}": (subscriber.metadata?.get("company") as string) || config.branding.name,
     "{{webinar}}": (subscriber.metadata?.get("webinar") as string) || "Upcoming Webinar",
+    // Resolved here (before the click-tracking rewrite) so the join button's
+    // href becomes a real URL that mail clients render as tappable AND gets
+    // wrapped for click tracking like any other link.
+    "{{join_link}}": (subscriber.metadata?.get("webinar_join_link") as string) || config.branding.websiteUrl,
     "{{date}}": new Date().toLocaleDateString("en-IN", { dateStyle: "long" }),
   };
 
