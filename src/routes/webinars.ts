@@ -448,7 +448,7 @@ router.post("/:id/reminders/:reminderId/test-send-whatsapp", async (req: Authent
       startsAt: webinar.starts_at,
       timezone: webinar.timezone,
       relativeTimePhrase: relativePhrase,
-      joinSuffix: webinar._id.toString(),
+      joinSuffix: String(webinar.source_window_id),
     });
 
     const result = await sendWhatsappTemplate({

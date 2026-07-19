@@ -201,7 +201,9 @@ export async function syncRegistrantsForWebinar(webinar: any, force = false): Pr
           // templates can point at this specific occurrence instead of a
           // hardcoded/static URL. Same redirect page the WhatsApp button's
           // dynamic suffix targets — see docs/whatsapp-templates.md.
-          "metadata.webinar_join_link": `${config.mainWebsite.url}/webinar/join/${webinar._id}`,
+          // Must be the main site's InvitationWindow id — /webinar/join/[windowId]
+          // resolves InvitationWindow.findById(), not this backend's Webinar._id.
+          "metadata.webinar_join_link": `${config.mainWebsite.url}/webinar/join/${webinar.source_window_id}`,
           ...(whatsapp_number ? { whatsapp_number } : {}),
         },
         $addToSet: { tags: tag },

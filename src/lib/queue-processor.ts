@@ -650,7 +650,7 @@ async function sendWhatsappLegForReminder(reminder: any, webinar: any, tag: stri
           startsAt: webinar.starts_at,
           timezone: webinar.timezone,
           relativeTimePhrase: relativePhrase,
-          joinSuffix: webinar._id.toString(),
+          joinSuffix: String(webinar.source_window_id),
         }
       );
 
