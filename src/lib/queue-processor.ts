@@ -524,6 +524,14 @@ async function sendEmailLegForReminder(reminder: any, webinar: any, tag: string,
   let sentInBatch = 0;
   let failedInBatch = 0;
 
+  // The reminder's webinar is authoritative for {{join_link}}/{{webinar}} —
+  // subscriber metadata can lag behind a registrant sync, and the WhatsApp
+  // leg already derives its button suffix from source_window_id.
+  const reminderTagOverrides: Record<string, string> = {
+    "{{join_link}}": `${config.mainWebsite.url}/webinar/join/${webinar.source_window_id}`,
+    "{{webinar}}": webinar.title,
+  };
+
   for (const sub of batch) {
     try {
       const customizedHtml = prepareEmailHtml({
@@ -532,6 +540,7 @@ async function sendEmailLegForReminder(reminder: any, webinar: any, tag: string,
         source,
         trackingUrl,
         trackingEnabled: { opens: true, clicks: true },
+        tagOverrides: reminderTagOverrides,
       });
 
       const finalHtml = wrapTextTemplate(customizedHtml, template.type);
@@ -540,7 +549,7 @@ async function sendEmailLegForReminder(reminder: any, webinar: any, tag: string,
         to: sub.email,
         fromName: claimed.sender_name,
         fromEmail: claimed.sender_email,
-        subject: replaceMergeTags(claimed.subject, sub),
+        subject: replaceMergeTags(claimed.subject, sub, reminderTagOverrides),
         html: finalHtml,
         headers: buildListUnsubscribeHeaders(trackingUrl, sub.email, source),
       });

@@ -22,6 +22,13 @@ interface ParseParams {
     opens: boolean;
     clicks: boolean;
   };
+  /**
+   * Authoritative values that win over subscriber.metadata for merge tags,
+   * e.g. {"{{join_link}}": "..."} on webinar reminder sends where the send
+   * context knows the webinar — avoids depending on per-subscriber sync
+   * timing for the correct join URL.
+   */
+  tagOverrides?: Record<string, string>;
 }
 
 function sourceQuery(source: TrackingSource, email: string): string {
@@ -71,6 +78,7 @@ export function prepareEmailHtml({
   source,
   trackingUrl,
   trackingEnabled,
+  tagOverrides,
 }: ParseParams): string {
   let parsedHtml = html || "";
   const recipientEmail = subscriber.email || "";
@@ -92,6 +100,7 @@ export function prepareEmailHtml({
     // wrapped for click tracking like any other link.
     "{{join_link}}": (subscriber.metadata?.get("webinar_join_link") as string) || config.branding.websiteUrl,
     "{{date}}": new Date().toLocaleDateString("en-IN", { dateStyle: "long" }),
+    ...(tagOverrides || {}),
   };
 
   // Replace standard variables
@@ -162,7 +171,11 @@ export function prepareEmailHtml({
  * metadata("webinar_join_link") — set by syncRegistrantsForWebinar() in
  * webinar-sync.ts — for {{webinar}} / {{join_link}}.
  */
-export function replaceMergeTags(text: string, subscriber: IEmailSubscriber): string {
+export function replaceMergeTags(
+  text: string,
+  subscriber: IEmailSubscriber,
+  tagOverrides?: Record<string, string>
+): string {
   const name = subscriber.first_name
     ? `${subscriber.first_name} ${subscriber.last_name || ""}`.trim()
     : "Subscriber";
@@ -176,6 +189,7 @@ export function replaceMergeTags(text: string, subscriber: IEmailSubscriber): st
     "{{webinar}}": (subscriber.metadata?.get("webinar") as string) || "Upcoming Webinar",
     "{{join_link}}": (subscriber.metadata?.get("webinar_join_link") as string) || config.branding.websiteUrl,
     "{{date}}": new Date().toLocaleDateString("en-IN", { dateStyle: "long" }),
+    ...(tagOverrides || {}),
   };
 
   let result = text;

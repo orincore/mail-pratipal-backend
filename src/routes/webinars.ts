@@ -388,7 +388,12 @@ router.post("/:id/reminders/:reminderId/test-send", async (req: AuthenticatedReq
       first_name: "Test",
       last_name: "Recipient",
       status: "subscribed",
-      metadata: new Map([["webinar", webinar.title]]),
+      metadata: new Map([
+        ["webinar", webinar.title],
+        // Same authoritative join URL the WhatsApp button suffix uses —
+        // without this the {{join_link}} tag falls back to the website URL.
+        ["webinar_join_link", `${config.mainWebsite.url}/webinar/join/${webinar.source_window_id}`],
+      ]),
     } as any;
 
     const trackingUrl = config.appUrl;
