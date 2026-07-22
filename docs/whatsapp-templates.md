@@ -221,3 +221,253 @@ All done. For reference, where each piece lives:
 - Template names in code (`WhatsappTemplateName` in
   `src/lib/whatsapp-templates.ts`) match the slugs in this doc exactly — keep
   both in lockstep if a template is ever renamed in MSG91.
+
+---
+
+# Transactional Templates (Orders, E-Books, Bookings, Invitations)
+
+These 8 templates power `POST /api/notifications/whatsapp/send`
+(`src/routes/notifications.ts`), called directly by **Pratipal Website** for
+its own transactional events — separate from the webinar lifecycle above.
+Defined in `src/lib/notification-templates.ts`
+(`TransactionalWhatsappEvent` / `buildTransactionalWhatsappParams`), which is
+intentionally kept apart from `whatsapp-templates.ts` since the data shape
+(order/booking fields) doesn't fit the webinar-specific
+`WhatsappTemplateData` interface.
+
+Same rules as above: **Category: UTILITY**, factual/non-promotional tone,
+language `en`. Each is tied to a transaction the recipient just completed
+(order placed, e-book purchased, session booked, form submitted) — the
+qualifying basis for Utility approval. **The template name in MSG91 must be
+created with the exact event name below** (they're used 1:1 as the MSG91
+template name — no separate mapping).
+
+Two templates (`order_confirmed_customer`, `order_status_update_customer`)
+share the same button target (`/track/<orderNumber>`); one
+(`ebook_delivered_customer`) points at a different stable redirect
+(`/api/download/<orderItemId>`). Both redirect routes live in Pratipal
+Website and resolve the real destination (tracking page / signed download
+URL) server-side, so the approved template's URL never needs to change even
+if the underlying page or file-hosting details do — same pattern as the
+`webinar/join/[windowId]` redirect above.
+
+---
+
+## 6. `invitation_registration_confirmed`
+
+**Trigger:** `POST /api/invitations` (`Pratipal Website/src/app/api/invitations/route.ts`)
+— fired instantly on landing-page/invitation form submit, customer-facing
+only. Replaces the admin notification **email** for this flow, which has
+been removed (the admin can still see submissions in
+`/admin/landing-pages/.../invitations`).
+
+**Body:**
+```
+Hi {{1}}, thanks for registering for *{{2}}*! We've received your details and will reach out here on WhatsApp with everything you need to know. If you have any questions, feel free to reply to this message.
+```
+
+| Var | Meaning | Source |
+|---|---|---|
+| `{{1}}` | First name | `InvitationRequest.first_name` |
+| `{{2}}` | Topic/session title | Landing page `title` (falls back to `"your session"` if unavailable) |
+
+**Buttons:** none
+
+---
+
+## 7. `order_confirmed_customer`
+
+**Trigger:** order placed and payment verified (`POST
+/api/razorpay/verify-payment`), customer-facing. All Pratipal orders are
+prepaid via Razorpay — there is no COD option in checkout — so the template
+doesn't carry a payment-method variable. (`POST /api/orders`'s COD branch
+also fires this same event/shape for parity if a COD order is ever created
+by some future/manual path, but that branch is not reachable from the
+current checkout UI.)
+
+**Body:**
+```
+Hi {{1}}, your order *{{2}}* has been confirmed! Items: {{3}}. Total paid: *₹{{4}}*. Tap below to track your order status anytime.
+```
+
+| Var | Meaning | Source |
+|---|---|---|
+| `{{1}}` | Customer name | `Order.customer_name` |
+| `{{2}}` | Order number | `Order.order_number` |
+| `{{3}}` | Itemized list | `formatOrderItemsForWhatsapp(orderItems)` (`Pratipal Website/src/lib/whatsapp.ts`) — e.g. `"Rose Quartz Crystal x2 (₹998.00), Lavender Essential Oil x1 (₹299.00)"`. Comma-separated, no newlines (Meta rejects newlines/tabs/4+ spaces in template parameter values); truncates with "+N more items" if the rendered body would exceed a safe length. |
+| `{{4}}` | Total | `Order.total`, 2dp |
+
+**Buttons:** 1 URL button — **"Track Order"** → dynamic URL, base
+`https://pratipal.in/track/`, suffix = `Order.order_number` (requires the
+button to be configured as Dynamic URL in MSG91, see the Join-link note
+above for the exact steps)
+
+---
+
+## 8. `order_confirmed_admin`
+
+**Trigger:** same as #7, admin-facing, sent to `ADMIN_WHATSAPP_NUMBER`.
+
+**Body:**
+```
+New order *{{1}}* received from {{2}} ({{3}}). Items: {{4}}. Total: *₹{{5}}* (paid). Please review and process it in the admin dashboard.
+```
+
+| Var | Meaning | Source |
+|---|---|---|
+| `{{1}}` | Order number | `Order.order_number` |
+| `{{2}}` | Customer name | `Order.customer_name` |
+| `{{3}}` | Customer phone | `shipping_address.phone` → `Customer.phone` fallback, `"—"` if none |
+| `{{4}}` | Itemized list | same `formatOrderItemsForWhatsapp()` output as #7 |
+| `{{5}}` | Total | `Order.total`, 2dp |
+
+**Buttons:** none
+
+---
+
+## 9. `order_status_update_customer`
+
+**Trigger:** `PATCH /api/admin/orders/[id]` when `tracking_status` changes
+(admin updates shipping status), customer-facing.
+
+**Body:**
+```
+Hi {{1}}, your order *{{2}}* status has been updated to *{{3}}*. Tap below for full tracking details.
+```
+
+| Var | Meaning | Source |
+|---|---|---|
+| `{{1}}` | Customer name | `Order.customer_name` |
+| `{{2}}` | Order number | `Order.order_number` |
+| `{{3}}` | Status label | `Order.tracking_status` (e.g. `"shipped"`, `"out_for_delivery"`, `"delivered"`) |
+
+**Buttons:** 1 URL button — **"Track Order"** → same dynamic URL as #7
+
+---
+
+## 10. `ebook_delivered_customer`
+
+**Trigger:** `POST /api/razorpay/verify-payment`, once per e-book
+`OrderItem` successfully emailed (fires right after the existing
+awaited e-book delivery email), customer-facing.
+
+**Body:**
+```
+Hi {{1}}, your e-book *{{2}}* from order *{{3}}* is ready! Tap the button below to download your copy.
+```
+
+| Var | Meaning | Source |
+|---|---|---|
+| `{{1}}` | Customer name | `Order.customer_name` |
+| `{{2}}` | Product name | `OrderItem.product_name` |
+| `{{3}}` | Order number | `Order.order_number` |
+
+**Buttons:** 1 URL button — **"Download E-Book"** → dynamic URL, base
+`https://pratipal.in/api/download/`, suffix = `OrderItem._id` (the redirect
+route resolves the actual, possibly-signed `ebook_download_url`
+server-side, so the button's approved URL never has to embed a fragile
+signed link with query params)
+
+---
+
+## 11. `ebook_sold_admin`
+
+**Trigger:** same as #10, admin-facing.
+
+**Note:** originally 5 separate variables — Meta rejected it ("This template
+has too many variables for its length"). Consolidated into 3, with more
+surrounding static text, per Meta's variable-density guidance.
+
+**Body:**
+```
+An e-book purchase has been completed on Pratipal. Product & order: {{1}}. Buyer: {{2}}. Amount paid: *₹{{3}}*. You can view the full order details in the admin dashboard.
+```
+
+| Var | Meaning | Source |
+|---|---|---|
+| `{{1}}` | Product & order | `"${OrderItem.product_name} — Order ${Order.order_number}"`, built at the call site |
+| `{{2}}` | Buyer | `"${Order.customer_name} (${Order.customer_email})"`, built at the call site |
+| `{{3}}` | Amount | `OrderItem.subtotal`, 2dp |
+
+**Buttons:** none
+
+---
+
+## 12. `booking_confirmed_customer`
+
+**Trigger:** `POST /api/bookings/verify-payment` (course or consultation
+session booking payment verified), customer-facing. Covers both
+`SessionBooking.order_type` values (`"course"` and `"service"`) via the
+`{{2}}` label rather than two separate templates.
+
+**Note:** originally 6 separate variables — Meta rejected it for the same
+too-many-variables reason as #11. Consolidated booking number/service/plan
+into one variable and lengthened the surrounding text.
+
+**Body:**
+```
+Hi {{1}}, great news — your {{2}} booking with Pratipal is confirmed! {{3}}. Amount paid: *₹{{4}}*. Our team will reach out to you here on WhatsApp shortly to schedule your session. Thank you for choosing us.
+```
+
+| Var | Meaning | Source |
+|---|---|---|
+| `{{1}}` | Customer name | `SessionBooking.customer_name` |
+| `{{2}}` | Session type label | `"Course"` / `"Consultation"` from `order_type` |
+| `{{3}}` | Booking summary | `"Booking #${booking_number} — ${service_name} (${frequency_label} plan)"`, built at the call site |
+| `{{4}}` | Amount | `SessionBooking.amount`, 2dp |
+
+**Buttons:** none
+
+---
+
+## 13. `booking_confirmed_admin`
+
+**Trigger:** same as #12, admin-facing.
+
+**Note:** originally 7 separate variables — the most severe case of Meta's
+too-many-variables rejection. Consolidated to 4.
+
+**Body:**
+```
+A new {{1}} booking has been received on Pratipal. {{2}}. Customer: {{3}}. Amount paid: *₹{{4}}*. Please reach out to the customer to schedule their session and update the booking status in the admin dashboard.
+```
+
+| Var | Meaning | Source |
+|---|---|---|
+| `{{1}}` | Session type label | same as #12 |
+| `{{2}}` | Booking summary | same composite as #12's `{{3}}` |
+| `{{3}}` | Customer | `"${customer_name} (${customer_whatsapp \|\| customer_phone})"`, built at the call site |
+| `{{4}}` | Amount | `SessionBooking.amount`, 2dp |
+
+**Buttons:** none
+
+---
+
+## Transactional recipient phone numbers
+
+Unlike the webinar flow (which reads from `EmailSubscriber.whatsapp_number`,
+normalized at ingest time), these events send `to` as a raw string from
+Pratipal Website's own data — `InvitationRequest.whatsapp_number`,
+`SessionBooking.customer_whatsapp`/`customer_phone`, or
+`Order.shipping_address.phone`/`Customer.phone`. `POST
+/api/notifications/whatsapp/send` normalizes it via the shared
+`normalizeWhatsappNumber()` (`src/lib/phone.ts`) before sending — the website
+does not need to normalize before calling. If no usable number resolves for
+an order, the website skips the send (logs only) rather than erroring the
+checkout.
+
+## Transactional implementation status
+
+- Route: `POST /api/notifications/whatsapp/send` (`src/routes/notifications.ts`),
+  protected by the same `authMiddleware` / shared `API_KEY` as
+  `/api/test-send/whatsapp`.
+- Website caller: `Pratipal Website/src/lib/whatsapp.ts`
+  (`sendWhatsappNotification()`) — fire-and-forget with an 8s timeout, never
+  throws, so a WhatsApp/MSG91 outage never blocks checkout, booking, or
+  registration. Existing email sends are unchanged/kept as the primary
+  channel; WhatsApp is additive everywhere except the invitation-form admin
+  notice, which the email was removed for.
+- All 8 template names above must be created in MSG91 and Meta-approved
+  before any of these sends will actually succeed — until then, the route
+  will return `{ success: false, error: ... }` per-call, which the website
+  already treats as best-effort and ignores.

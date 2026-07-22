@@ -15,6 +15,7 @@ import jobsRouter from "./routes/jobs";
 import dashboardRouter from "./routes/dashboard";
 import webinarsRouter from "./routes/webinars";
 import segmentsRouter from "./routes/segments";
+import notificationsRouter from "./routes/notifications";
 
 const app = express();
 
@@ -74,6 +75,7 @@ app.use("/api/test-send", testSendRouter);
 app.use("/api/jobs", jobsRouter);
 app.use("/api/segments", segmentsRouter);
 app.use("/api/webinars", webinarsRouter);
+app.use("/api/notifications", notificationsRouter);
 app.use("/api", dashboardRouter);
 
 // Standard Health Check

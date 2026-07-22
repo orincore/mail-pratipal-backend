@@ -4,6 +4,9 @@ import EmailSubscriber from "../models/EmailSubscriber";
 import { config } from "../config";
 import { sendWhatsappTemplate } from "../providers/msg91-whatsapp.provider";
 import { buildWhatsappTemplateParams } from "./whatsapp-templates";
+import { normalizeWhatsappNumber } from "./phone";
+
+export { normalizeWhatsappNumber };
 
 // Shared by the registration-confirmation, cancellation, and reschedule
 // notices below — logs and swallows a send failure for one recipient rather
@@ -137,18 +140,6 @@ export async function syncWebinarsFromWebsite(force = false): Promise<void> {
       }
     }
   }
-}
-
-// Registrants type a bare 10-digit number (no country code) most of the time
-// since the signup form is a plain <input type="tel">. Normalize to E.164 so
-// numbers are usable by the MSG91 WhatsApp Cloud API without per-send cleanup.
-export function normalizeWhatsappNumber(raw?: string | null): string | undefined {
-  if (!raw) return undefined;
-  const digits = raw.replace(/[^\d]/g, "");
-  if (!digits) return undefined;
-  if (digits.length === 10) return `+91${digits}`;
-  if (digits.length > 10) return `+${digits.replace(/^0+/, "")}`;
-  return undefined;
 }
 
 /**
