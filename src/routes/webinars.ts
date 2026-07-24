@@ -29,6 +29,22 @@ const PRESET_OFFSETS: Record<string, { offset_type: string; offset_value?: numbe
   at_start: { offset_type: "at_start", name: "At webinar start" },
 };
 
+// Maps each preset to the *name* of the EmailTemplate it should default to.
+// Keyed by name (not _id) because EmailTemplate documents are admin-created
+// per brand's isolated DB, so IDs differ across deployments while a template
+// name stays a stable, human-meaningful anchor. Mirrors
+// DEFAULT_WHATSAPP_TEMPLATE_FOR_PRESET's 3-way split: the 3/2/1-day-before
+// reminders share a no-CTA "upcoming" template (the join link isn't live yet),
+// while 30-min-before and at-start each get their own urgent, join-button
+// template.
+const DEFAULT_EMAIL_TEMPLATE_NAME_FOR_PRESET: Record<string, string> = {
+  "3_days_before": "Webinar Upcoming Reminder",
+  "2_days_before": "Webinar Upcoming Reminder",
+  "1_day_before": "Webinar Upcoming Reminder",
+  "30_min_before": "Webinar Starting Soon",
+  at_start: "Webinar Live Now",
+};
+
 async function registrantCount(webinar: { source_window_id: string }) {
   return EmailSubscriber.countDocuments({ tags: webinarTag(webinar) });
 }
@@ -36,7 +52,11 @@ async function registrantCount(webinar: { source_window_id: string }) {
 // GET /api/webinars/meta/whatsapp-templates - MSG91-synced template metadata for the reminder UI
 router.get("/meta/whatsapp-templates", async (_req: AuthenticatedRequest, res: Response) => {
   const templates = await getMergedWhatsappTemplates();
-  return res.json({ templates, defaultForPreset: DEFAULT_WHATSAPP_TEMPLATE_FOR_PRESET });
+  return res.json({
+    templates,
+    defaultForPreset: DEFAULT_WHATSAPP_TEMPLATE_FOR_PRESET,
+    defaultEmailTemplateNameForPreset: DEFAULT_EMAIL_TEMPLATE_NAME_FOR_PRESET,
+  });
 });
 
 // GET /api/webinars - list webinars with live registrant counts + reminders
@@ -199,7 +219,23 @@ router.post("/:id/reminders", async (req: AuthenticatedRequest, res: Response) =
     if (resolvedOffsetType === "custom" && !custom_at) {
       return res.status(400).json({ error: "custom_at is required for a custom offset_type" });
     }
-    if (resolvedChannel !== "whatsapp" && (!template_id || !subject || !sender_name || !sender_email)) {
+
+    // If the caller didn't pick an email template explicitly, fall back to
+    // this preset's default (e.g. the 30-min-before reminder should default
+    // to the join-button "Starting Soon" template, not whatever the last
+    // reminder on this webinar happened to use).
+    let resolvedTemplateId = template_id;
+    let resolvedSubject = subject;
+    if (resolvedChannel !== "whatsapp" && !resolvedTemplateId && preset) {
+      const defaultTemplateName = DEFAULT_EMAIL_TEMPLATE_NAME_FOR_PRESET[preset];
+      const defaultTemplate = defaultTemplateName ? await EmailTemplate.findOne({ name: defaultTemplateName }) : null;
+      if (defaultTemplate) {
+        resolvedTemplateId = defaultTemplate._id.toString();
+        resolvedSubject = resolvedSubject || defaultTemplate.subject;
+      }
+    }
+
+    if (resolvedChannel !== "whatsapp" && (!resolvedTemplateId || !resolvedSubject || !sender_name || !sender_email)) {
       return res.status(400).json({ error: "template_id, subject, sender_name and sender_email are required for the email channel" });
     }
 
@@ -233,8 +269,8 @@ router.post("/:id/reminders", async (req: AuthenticatedRequest, res: Response) =
       offset_value: resolvedOffsetValue,
       custom_at: custom_at ? new Date(custom_at) : undefined,
       channel: resolvedChannel,
-      template_id: resolvedChannel !== "whatsapp" ? template_id : undefined,
-      subject: resolvedChannel !== "whatsapp" ? subject : undefined,
+      template_id: resolvedChannel !== "whatsapp" ? resolvedTemplateId : undefined,
+      subject: resolvedChannel !== "whatsapp" ? resolvedSubject : undefined,
       sender_name: resolvedChannel !== "whatsapp" ? sender_name : undefined,
       sender_email: resolvedChannel !== "whatsapp" ? sender_email : undefined,
       whatsapp_template: resolvedChannel !== "email" ? resolvedWhatsappTemplate : undefined,
