@@ -1,3 +1,11 @@
+import dns from "node:dns";
+// MSG91 whitelists by IP, but this VPS is dual-stack and undici's fetch was
+// picking a fresh IPv6 address (from the host's rotating temporary-address
+// pool) on every outbound call, so no single address could ever stay
+// whitelisted. Forcing IPv4 first pins outbound connections to the stable
+// IPv4 address MSG91 can actually whitelist.
+dns.setDefaultResultOrder("ipv4first");
+
 import express from "express";
 import cors from "cors";
 import cookieParser from "cookie-parser";

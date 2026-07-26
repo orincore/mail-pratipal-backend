@@ -1,3 +1,8 @@
+import dns from "node:dns";
+// Same fix as server.ts: pin outbound connections to IPv4 so MSG91's IP
+// whitelist (which this VPS's rotating IPv6 addresses kept breaking) works.
+dns.setDefaultResultOrder("ipv4first");
+
 import dotenv from "dotenv";
 import path from "path";
 import { connectDB } from "../lib/db";
