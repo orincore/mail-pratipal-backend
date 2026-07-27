@@ -101,6 +101,15 @@ export async function syncWebinarsFromWebsite(force = false): Promise<void> {
       { upsert: true, new: true }
     );
 
+    // Nothing else ever transitions a webinar out of "upcoming" once its
+    // start time passes — cancellation is the only other status change, set
+    // manually via PUT /api/webinars/:id. Without this, the dashboard shows
+    // "upcoming" forever for webinars that happened weeks ago.
+    if (webinar.status === "upcoming" && webinar.starts_at.getTime() < Date.now()) {
+      webinar.status = "completed";
+      await webinar.save();
+    }
+
     if (startsAtChanged) {
       // Never touch reminders that already fired/are firing, and never reinterpret
       // an intentionally-fixed custom absolute date.

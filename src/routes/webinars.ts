@@ -4,7 +4,9 @@ import Webinar from "../models/Webinar";
 import WebinarReminder from "../models/WebinarReminder";
 import EmailSubscriber from "../models/EmailSubscriber";
 import EmailTemplate from "../models/EmailTemplate";
+import EmailEvent from "../models/EmailEvent";
 import { syncWebinarsFromWebsite, syncRegistrantsForWebinar, computeSendAt, webinarTag, sendLifecycleWhatsapp } from "../lib/webinar-sync";
+import { sendEmailLegForReminder, sendWhatsappLegForReminder } from "../lib/queue-processor";
 import { getEmailProvider } from "../providers/provider-factory";
 import { prepareEmailHtml, replaceMergeTags } from "../lib/tracking-parser";
 import { sendWhatsappTemplate } from "../providers/msg91-whatsapp.provider";
@@ -502,6 +504,106 @@ router.post("/:id/reminders/:reminderId/test-send-whatsapp", async (req: Authent
     return res.json({ success: true, messageId: result.messageId, dispatched_at: new Date().toISOString() });
   } catch (error: any) {
     console.error("Webinar reminder WhatsApp test-send error:", error);
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/webinars/:id/reminders/:reminderId/send-now-preview - audience
+// count for the confirmation dialog before an instant send. Mirrors the exact
+// "not yet sent" query each leg sender uses, so the number shown matches what
+// will actually happen.
+router.get("/:id/reminders/:reminderId/send-now-preview", async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const reminder = await WebinarReminder.findOne({ _id: req.params.reminderId, webinar_id: req.params.id });
+    if (!reminder) {
+      return res.status(404).json({ error: "Reminder not found" });
+    }
+    const webinar = await Webinar.findById(reminder.webinar_id);
+    if (!webinar) {
+      return res.status(404).json({ error: "Webinar not found" });
+    }
+
+    const tag = webinarTag(webinar);
+    let emailPending = 0;
+    let whatsappPending = 0;
+
+    if (reminder.channel !== "whatsapp") {
+      const subscribers = await EmailSubscriber.find({ status: "subscribed", tags: tag }).select("email").lean();
+      const sentEmails = await EmailEvent.find({
+        reminder_id: reminder._id,
+        channel: "email",
+        event_type: "sent",
+      }).distinct("recipient_email");
+      const sentSet = new Set(sentEmails.map((e) => e.toLowerCase()));
+      emailPending = subscribers.filter((s) => s.email && !sentSet.has(s.email.toLowerCase())).length;
+    }
+
+    if (reminder.channel !== "email") {
+      const subscribers = await EmailSubscriber.find({
+        status: "subscribed",
+        tags: tag,
+        whatsapp_number: { $exists: true, $ne: null },
+      }).select("email").lean();
+      const sentTo = await EmailEvent.find({
+        reminder_id: reminder._id,
+        channel: "whatsapp",
+        event_type: "sent",
+      }).distinct("recipient_email");
+      const sentSet = new Set(sentTo.map((e) => e.toLowerCase()));
+      whatsappPending = subscribers.filter((s) => s.email && !sentSet.has(s.email.toLowerCase())).length;
+    }
+
+    return res.json({
+      channel: reminder.channel,
+      webinar_status: webinar.status,
+      email_pending: emailPending,
+      whatsapp_pending: whatsappPending,
+    });
+  } catch (error: any) {
+    console.error("Webinar reminder send-now-preview error:", error);
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/webinars/:id/reminders/:reminderId/send-now - manual override that
+// fires this reminder immediately to everyone currently registered who hasn't
+// received it yet, regardless of its scheduled computed_send_at. Reuses the
+// exact same per-leg senders the scheduled sweep uses, so history/idempotency
+// (no duplicate sends to someone already sent to) and batching behavior are
+// identical — a large audience still sends its first batch now and the rest
+// on the next regular sweep, same as any other reminder.
+router.post("/:id/reminders/:reminderId/send-now", async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const reminder = await WebinarReminder.findOne({ _id: req.params.reminderId, webinar_id: req.params.id });
+    if (!reminder) {
+      return res.status(404).json({ error: "Reminder not found" });
+    }
+    const webinar = await Webinar.findById(reminder.webinar_id);
+    if (!webinar) {
+      return res.status(404).json({ error: "Webinar not found" });
+    }
+    if (webinar.status !== "upcoming") {
+      return res.status(400).json({ error: `Can't send — this webinar is ${webinar.status}, not upcoming` });
+    }
+
+    await syncRegistrantsForWebinar(webinar);
+    const tag = webinarTag(webinar);
+
+    const results: any[] = [];
+    if (reminder.channel !== "whatsapp") {
+      const provider = getEmailProvider();
+      const trackingUrl = config.appUrl;
+      const result = await sendEmailLegForReminder(reminder, webinar, tag, provider, trackingUrl);
+      if (result) results.push(result);
+    }
+    if (reminder.channel !== "email") {
+      const result = await sendWhatsappLegForReminder(reminder, webinar, tag);
+      if (result) results.push(result);
+    }
+
+    return res.json({ success: true, results });
+  } catch (error: any) {
+    console.error("Webinar reminder send-now error:", error);
     return res.status(500).json({ error: error.message });
   }
 });

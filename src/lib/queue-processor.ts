@@ -470,7 +470,7 @@ async function processWebinarReminders(provider: any, trackingUrl: string) {
   return summary;
 }
 
-async function sendEmailLegForReminder(reminder: any, webinar: any, tag: string, provider: any, trackingUrl: string) {
+export async function sendEmailLegForReminder(reminder: any, webinar: any, tag: string, provider: any, trackingUrl: string) {
   let claimed = reminder;
   if (reminder.dispatch_status === "pending") {
     // Atomically claim this leg so a concurrent sweep (worker + /api/jobs/process
@@ -593,7 +593,7 @@ async function sendEmailLegForReminder(reminder: any, webinar: any, tag: string,
   };
 }
 
-async function sendWhatsappLegForReminder(reminder: any, webinar: any, tag: string) {
+export async function sendWhatsappLegForReminder(reminder: any, webinar: any, tag: string) {
   let claimed = reminder;
   if (reminder.whatsapp_dispatch_status === "pending") {
     const result = await WebinarReminder.findOneAndUpdate(
