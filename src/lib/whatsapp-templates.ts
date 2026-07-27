@@ -8,10 +8,13 @@
 // DEFAULT_WHATSAPP_TEMPLATE_FOR_PRESET both point at each preset's real,
 // specific template rather than the "event_notify" generic — that one stays
 // in the type union and selectable as a manual fallback, but is no longer
-// anyone's default. webinar_registration_confirmation/_cancelled/_rescheduled
-// aren't reminder-preset templates (they're sent automatically from
-// webinar-sync.ts / the cancel route, not chosen per-reminder) so they're
-// not part of this dropdown list.
+// anyone's default. webinar_registration_confirmation is also selectable
+// (added so it can be manually scheduled/re-sent, e.g. via Send Instantly)
+// even though its primary use is still the automatic send from
+// webinar-sync.ts on registration. webinar_cancelled/_rescheduled stay out
+// of the dropdown — those are only ever sent automatically (from the cancel
+// route / a starts_at change) and firing one manually mid-flow would be
+// actively misleading (there's no cancellation/reschedule to report).
 
 export type WhatsappTemplateName =
   | "event_notify"
@@ -39,6 +42,12 @@ export interface WhatsappTemplateDef {
 }
 
 export const WHATSAPP_TEMPLATES: WhatsappTemplateDef[] = [
+  {
+    name: "webinar_registration_confirmation",
+    label: "Registration Confirmation",
+    description: "The \"Your seat is confirmed\" message — sent automatically the instant someone registers. Selectable here so it can also be scheduled as a manual reminder or fired with Send Instantly (e.g. to re-notify everyone currently registered). Text-only, no button.",
+    hasButton: false,
+  },
   {
     name: "webinar_remind",
     label: "Webinar Reminder",
