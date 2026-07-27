@@ -5,6 +5,7 @@ import { config } from "../config";
 import { sendWhatsappTemplate } from "../providers/msg91-whatsapp.provider";
 import { buildWhatsappTemplateParams } from "./whatsapp-templates";
 import { normalizeWhatsappNumber } from "./phone";
+import { scheduleReminderJob } from "./queue/queues";
 
 export { normalizeWhatsappNumber };
 
@@ -111,12 +112,14 @@ export async function syncWebinarsFromWebsite(force = false): Promise<void> {
     }
 
     if (startsAtChanged) {
-      // Never touch reminders that already fired/are firing, and never reinterpret
-      // an intentionally-fixed custom absolute date.
+      // Never touch reminders that already fired/are firing, and never
+      // reinterpret an intentionally-fixed custom absolute date. $or on both
+      // dispatch fields — an email-only query here used to silently skip
+      // rescheduling whatsapp-only reminders when a webinar's start moved.
       const pendingReminders = await WebinarReminder.find({
         webinar_id: webinar._id,
-        dispatch_status: "pending",
         offset_type: { $ne: "custom" },
+        $or: [{ dispatch_status: "pending" }, { whatsapp_dispatch_status: "pending" }],
       });
       for (const reminder of pendingReminders) {
         reminder.computed_send_at = computeSendAt(
@@ -125,6 +128,9 @@ export async function syncWebinarsFromWebsite(force = false): Promise<void> {
           reminder.offset_value
         );
         await reminder.save();
+        // Re-arm the delayed job to the new time — without this, a stale
+        // BullMQ job would still fire at the old computed_send_at.
+        await scheduleReminderJob(reminder);
       }
 
       // Let already-registered attendees know the time moved. Only for a
@@ -177,46 +183,68 @@ export async function syncRegistrantsForWebinar(webinar: any, force = false): Pr
   const tag = webinarTag(webinar);
   const currentEmails = new Set<string>();
 
+  // Was previously one `exists` + one `findOneAndUpdate` PER registrant,
+  // awaited sequentially — with several hundred registrants per window and
+  // "Sync Now" force-syncing every upcoming webinar in one request, that was
+  // ~2 DB round-trips per registrant (thousands total), which is what made
+  // the dashboard's Sync Now button hang. Batched instead: one query to find
+  // who's already tagged for this window (to preserve "only message genuinely
+  // new registrants" semantics) and one bulkWrite for all the upserts.
+  const alreadyTaggedEmails = new Set(
+    (await EmailSubscriber.find({ tags: tag }).select("email").lean()).map((s: any) =>
+      (s.email || "").toLowerCase()
+    )
+  );
+
+  const newlyRegistered: { email: string; first_name?: string; whatsapp_number?: string }[] = [];
+  const bulkOps: any[] = [];
+
   for (const r of registrants || []) {
     if (!r.email) continue;
     const email = r.email.toLowerCase();
     currentEmails.add(email);
     const whatsapp_number = normalizeWhatsappNumber(r.whatsapp_number);
 
-    // Detect a genuinely new registrant for *this occurrence* before
-    // upserting — webinarTag() is scoped per window, so someone who
-    // registered for an earlier run of the same webinar (and is already an
-    // EmailSubscriber from that) still counts as new here if they don't
-    // have this window's tag yet.
-    const alreadyRegisteredForThisWindow = await EmailSubscriber.exists({ email, tags: tag });
+    if (!alreadyTaggedEmails.has(email)) {
+      newlyRegistered.push({ email, first_name: r.first_name, whatsapp_number });
+    }
 
-    await EmailSubscriber.findOneAndUpdate(
-      { email },
-      {
-        $setOnInsert: { status: "subscribed" },
-        $set: {
-          first_name: r.first_name,
-          "metadata.webinar": webinar.title,
-          // Powers the {{join_link}} merge tag (tracking-parser.ts) so email
-          // templates can point at this specific occurrence instead of a
-          // hardcoded/static URL. Same redirect page the WhatsApp button's
-          // dynamic suffix targets — see docs/whatsapp-templates.md.
-          // Must be the main site's InvitationWindow id — /webinar/join/[windowId]
-          // resolves InvitationWindow.findById(), not this backend's Webinar._id.
-          "metadata.webinar_join_link": `${config.mainWebsite.url}/webinar/join/${webinar.source_window_id}`,
-          ...(whatsapp_number ? { whatsapp_number } : {}),
+    bulkOps.push({
+      updateOne: {
+        filter: { email },
+        update: {
+          $setOnInsert: { status: "subscribed" },
+          $set: {
+            first_name: r.first_name,
+            "metadata.webinar": webinar.title,
+            // Powers the {{join_link}} merge tag (tracking-parser.ts) so email
+            // templates can point at this specific occurrence instead of a
+            // hardcoded/static URL. Same redirect page the WhatsApp button's
+            // dynamic suffix targets — see docs/whatsapp-templates.md.
+            // Must be the main site's InvitationWindow id — /webinar/join/[windowId]
+            // resolves InvitationWindow.findById(), not this backend's Webinar._id.
+            "metadata.webinar_join_link": `${config.mainWebsite.url}/webinar/join/${webinar.source_window_id}`,
+            ...(whatsapp_number ? { whatsapp_number } : {}),
+          },
+          $addToSet: { tags: tag },
         },
-        $addToSet: { tags: tag },
+        upsert: true,
       },
-      { upsert: true }
-    );
+    });
+  }
 
-    if (!alreadyRegisteredForThisWindow && whatsapp_number && webinar.status === "upcoming") {
+  if (bulkOps.length > 0) {
+    await EmailSubscriber.bulkWrite(bulkOps, { ordered: false });
+  }
+
+  if (webinar.status === "upcoming") {
+    for (const r of newlyRegistered) {
+      if (!r.whatsapp_number) continue;
       await sendLifecycleWhatsapp(
         "webinar_registration_confirmation",
-        whatsapp_number,
+        r.whatsapp_number,
         { firstName: r.first_name || "there", webinarTitle: webinar.title, startsAt: webinar.starts_at, timezone: webinar.timezone },
-        email
+        r.email
       );
     }
   }

@@ -6,7 +6,8 @@ import EmailSubscriber from "../models/EmailSubscriber";
 import EmailTemplate from "../models/EmailTemplate";
 import EmailEvent from "../models/EmailEvent";
 import { syncWebinarsFromWebsite, syncRegistrantsForWebinar, computeSendAt, webinarTag, sendLifecycleWhatsapp } from "../lib/webinar-sync";
-import { sendEmailLegForReminder, sendWhatsappLegForReminder } from "../lib/queue-processor";
+import { scheduleReminderJob, cancelReminderJob } from "../lib/queue/queues";
+import { fanOutReminderLeg } from "../lib/queue/fan-out";
 import { getEmailProvider } from "../providers/provider-factory";
 import { prepareEmailHtml, replaceMergeTags } from "../lib/tracking-parser";
 import { sendWhatsappTemplate } from "../providers/msg91-whatsapp.provider";
@@ -141,14 +142,18 @@ router.put("/:id", async (req: AuthenticatedRequest, res: Response) => {
         { webinar_id: webinar._id, dispatch_status: "pending" },
         { $set: { dispatch_status: "skipped" } }
       );
-      // The reminder sweep already defensively skips whatsapp legs for a
-      // cancelled webinar's due reminders (processWebinarReminders), but
+      // The scheduler worker already defensively skips both legs for a
+      // cancelled webinar's due reminders (reminder-scheduler.worker.ts), but
       // update it here too so the DB reflects "skipped" immediately rather
-      // than only once/if that reminder becomes due.
+      // than only once/if that reminder's delayed job fires.
       await WebinarReminder.updateMany(
         { webinar_id: webinar._id, whatsapp_dispatch_status: "pending" },
         { $set: { whatsapp_dispatch_status: "skipped" } }
       );
+      // Drop every pending delayed job for this webinar's reminders so a
+      // stale one can't fire into a now-cancelled webinar.
+      const affectedReminders = await WebinarReminder.find({ webinar_id: webinar._id }).select("_id");
+      await Promise.all(affectedReminders.map((r: any) => cancelReminderJob(r._id)));
 
       // Notify everyone already registered for this occurrence.
       const tag = webinarTag(webinar);
@@ -281,6 +286,10 @@ router.post("/:id/reminders", async (req: AuthenticatedRequest, res: Response) =
       whatsapp_dispatch_status: resolvedChannel === "email" ? "skipped" : initialDispatchStatus,
     });
 
+    if (initialDispatchStatus !== "skipped") {
+      await scheduleReminderJob(reminder);
+    }
+
     return res.status(201).json({ reminder });
   } catch (error: any) {
     console.error("POST webinar reminder error:", error);
@@ -375,6 +384,19 @@ router.put("/:id/reminders/:reminderId", async (req: AuthenticatedRequest, res: 
     }
 
     await reminder.save();
+
+    // Reconcile the delayed BullMQ job to match the reminder's final state —
+    // simpler and more robust than trying to track exactly which field
+    // change (reset, offset edit, channel switch) should re-arm/disarm it.
+    const legsTerminal =
+      ["sent", "skipped"].includes(reminder.dispatch_status) &&
+      ["sent", "skipped"].includes(reminder.whatsapp_dispatch_status);
+    if (reminder.status !== "active" || legsTerminal) {
+      await cancelReminderJob(reminder._id);
+    } else {
+      await scheduleReminderJob(reminder);
+    }
+
     return res.json({ reminder });
   } catch (error: any) {
     console.error("PUT webinar reminder error:", error);
@@ -567,11 +589,12 @@ router.get("/:id/reminders/:reminderId/send-now-preview", async (req: Authentica
 
 // POST /api/webinars/:id/reminders/:reminderId/send-now - manual override that
 // fires this reminder immediately to everyone currently registered who hasn't
-// received it yet, regardless of its scheduled computed_send_at. Reuses the
-// exact same per-leg senders the scheduled sweep uses, so history/idempotency
-// (no duplicate sends to someone already sent to) and batching behavior are
-// identical — a large audience still sends its first batch now and the rest
-// on the next regular sweep, same as any other reminder.
+// received it yet, regardless of its scheduled computed_send_at. Shares the
+// exact same fan-out (audience selection + idempotency) the scheduled path
+// uses via fanOutReminderLeg — enqueues the full audience as rate-limited
+// BullMQ jobs and returns immediately; the queue workers (mail-queue-worker)
+// drain it in the background. stats.sent/whatsapp_sent climb live as each
+// per-recipient job completes — poll GET /:id to watch progress.
 router.post("/:id/reminders/:reminderId/send-now", async (req: AuthenticatedRequest, res: Response) => {
   try {
     const reminder = await WebinarReminder.findOne({ _id: req.params.reminderId, webinar_id: req.params.id });
@@ -586,22 +609,19 @@ router.post("/:id/reminders/:reminderId/send-now", async (req: AuthenticatedRequ
       return res.status(400).json({ error: `Can't send — this webinar is ${webinar.status}, not upcoming` });
     }
 
+    if (reminder.computed_send_at.getTime() > Date.now()) {
+      reminder.computed_send_at = new Date();
+      await reminder.save();
+    }
+    // Drop any pending delayed job — we're firing now instead of waiting for it.
+    await cancelReminderJob(reminder._id);
+
     await syncRegistrantsForWebinar(webinar);
-    const tag = webinarTag(webinar);
 
-    const results: any[] = [];
-    if (reminder.channel !== "whatsapp") {
-      const provider = getEmailProvider();
-      const trackingUrl = config.appUrl;
-      const result = await sendEmailLegForReminder(reminder, webinar, tag, provider, trackingUrl);
-      if (result) results.push(result);
-    }
-    if (reminder.channel !== "email") {
-      const result = await sendWhatsappLegForReminder(reminder, webinar, tag);
-      if (result) results.push(result);
-    }
+    if (reminder.channel !== "whatsapp") await fanOutReminderLeg(reminder, webinar, "email");
+    if (reminder.channel !== "email") await fanOutReminderLeg(reminder, webinar, "whatsapp");
 
-    return res.json({ success: true, results });
+    return res.status(202).json({ success: true, enqueued: true });
   } catch (error: any) {
     console.error("Webinar reminder send-now error:", error);
     return res.status(500).json({ error: error.message });
@@ -611,6 +631,7 @@ router.post("/:id/reminders/:reminderId/send-now", async (req: AuthenticatedRequ
 // DELETE /api/webinars/:id/reminders/:reminderId
 router.delete("/:id/reminders/:reminderId", async (req: AuthenticatedRequest, res: Response) => {
   try {
+    await cancelReminderJob(req.params.reminderId);
     const result = await WebinarReminder.findOneAndDelete({
       _id: req.params.reminderId,
       webinar_id: req.params.id,

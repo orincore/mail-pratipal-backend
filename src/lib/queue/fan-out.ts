@@ -1,0 +1,100 @@
+import WebinarReminder from "../../models/WebinarReminder";
+import EmailSubscriber from "../../models/EmailSubscriber";
+import EmailEvent from "../../models/EmailEvent";
+import { webinarTag } from "../webinar-sync";
+import { flowProducer } from "./queues";
+import { config } from "../../config";
+
+export type ReminderChannel = "email" | "whatsapp";
+
+// Identical "who hasn't received this yet" query the old sweep used —
+// tagged for this webinar occurrence, subscribed, and no "sent" EmailEvent
+// for this reminder+channel. Not reinvented, just relocated.
+async function pendingSubscribersForLeg(reminderId: any, tag: string, channel: ReminderChannel) {
+  const subscribers = await EmailSubscriber.find({ status: "subscribed", tags: tag });
+  const sentTo = await EmailEvent.find({
+    reminder_id: reminderId,
+    channel,
+    event_type: "sent",
+  }).distinct("recipient_email");
+  const sentSet = new Set(sentTo.map((e: string) => e.toLowerCase()));
+  return subscribers.filter((sub: any) => sub.email && !sentSet.has(sub.email.toLowerCase()));
+}
+
+/**
+ * Enqueues one send job per pending recipient for a single (reminder,
+ * channel) leg, wrapped in a FlowProducer parent job that flips the leg's
+ * dispatch_status to "sent" once every child has settled. Shared by both the
+ * scheduled delayed-job path (reminder-scheduler.worker.ts) and the manual
+ * "Send Instantly" route — one implementation, no duplicated audience/claim
+ * logic between "scheduled" and "instant".
+ *
+ * Job data carries only IDs, not rendered content — a job can sit queued for
+ * a while behind the rate limiter, and each worker re-fetches fresh
+ * subscriber/template/webinar state at send time so nothing stale (e.g. a
+ * mid-flight unsubscribe) gets baked in at enqueue time.
+ */
+export async function fanOutReminderLeg(reminder: any, webinar: any, channel: ReminderChannel): Promise<void> {
+  const statusField = channel === "email" ? "dispatch_status" : "whatsapp_dispatch_status";
+
+  // Leg-wide config problem (not per-recipient) — fail fast before enqueuing
+  // anything, same as the old sweep's upfront check.
+  if (channel === "email" && !reminder.template_id) {
+    await WebinarReminder.updateOne({ _id: reminder._id }, { $set: { [statusField]: "skipped" } });
+    return;
+  }
+  if (channel === "whatsapp" && !reminder.whatsapp_template) {
+    await WebinarReminder.updateOne({ _id: reminder._id }, { $set: { [statusField]: "skipped" } });
+    return;
+  }
+
+  const tag = webinarTag(webinar);
+  const pending = await pendingSubscribersForLeg(reminder._id, tag, channel);
+
+  if (pending.length === 0) {
+    await WebinarReminder.updateOne({ _id: reminder._id }, { $set: { [statusField]: "sent" } });
+    return;
+  }
+
+  // Atomically claim "pending" -> "sending" so two concurrent triggers (the
+  // scheduled job firing at the same instant an admin clicks Send Instantly)
+  // can't both snapshot the audience and enqueue duplicate flows. If it's
+  // already "sending" (e.g. a reconciliation re-check while a previous flow
+  // is still draining), proceed anyway — the per-recipient jobId below makes
+  // re-adding a no-op for anyone already enqueued.
+  if (reminder[statusField] === "pending") {
+    const claimed = await WebinarReminder.findOneAndUpdate(
+      { _id: reminder._id, [statusField]: "pending" },
+      { $set: { [statusField]: "sending" } }
+    );
+    if (!claimed) return; // someone else just claimed it
+  }
+
+  const queueName = channel === "email" ? "email-send" : "whatsapp-send";
+  const maxRetries = channel === "email" ? config.email.sendMaxRetries : config.whatsapp.sendMaxRetries;
+
+  await flowProducer.add({
+    name: "finalize",
+    queueName: "reminder-finalize",
+    data: { reminderId: reminder._id.toString(), channel },
+    opts: {
+      // BullMQ rejects ":" in custom job IDs (its own Redis key separator).
+      jobId: `finalize-${channel}-${reminder._id}`,
+      removeOnComplete: true,
+      removeOnFail: { age: 7 * 24 * 3600 },
+    },
+    children: pending.map((sub: any) => ({
+      name: "send",
+      queueName,
+      data: { reminderId: reminder._id.toString(), subscriberId: sub._id.toString() },
+      opts: {
+        // BullMQ-level dedup — defense-in-depth alongside the EmailEvent check.
+        jobId: `${channel}-${reminder._id}-${sub._id}`,
+        attempts: maxRetries + 1,
+        backoff: { type: "custom" },
+        removeOnComplete: { age: 24 * 3600, count: 5000 },
+        removeOnFail: { age: 7 * 24 * 3600 },
+      },
+    })),
+  });
+}

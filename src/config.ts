@@ -109,5 +109,21 @@ export const config = {
       namespace: process.env.MSG91_WHATSAPP_NAMESPACE || "",
       languageCode: process.env.MSG91_WHATSAPP_LANGUAGE_CODE || "en",
     },
+    /**
+     * MSG91's actual per-second throughput for this account is unconfirmed —
+     * nothing paced WhatsApp sends before the BullMQ queue existed. Starts
+     * conservative; raise via env once confirmed from MSG91's dashboard/support,
+     * no code change needed.
+     */
+    maxSendRatePerSecond: Math.max(1, parseInt(process.env.MSG91_MAX_SEND_RATE || "5", 10) || 5),
+    sendMaxRetries: Math.max(0, parseInt(process.env.WHATSAPP_SEND_MAX_RETRIES || "2", 10) || 2),
+  },
+  redis: {
+    url: process.env.REDIS_URL || "redis://127.0.0.1:6379",
+    /**
+     * Isolates this brand's BullMQ queues inside a Redis instance shared with
+     * other brand deployments (both mail backends run on the same VPS/Redis).
+     */
+    queuePrefix: process.env.QUEUE_PREFIX || "pratipal",
   },
 };

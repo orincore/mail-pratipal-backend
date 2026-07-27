@@ -84,11 +84,15 @@ export async function sendWhatsappTemplate(opts: SendWhatsappTemplateOptions): P
     // "HTTP 401"/"HTTP 400".
     const detail = json?.errors || json?.error || json?.message;
     const apiErrorNote = json?.apiError ? ` [apiError ${json.apiError}]` : "";
-    throw new Error(
+    const err = new Error(
       detail
         ? `MSG91 WhatsApp send failed: ${JSON.stringify(detail)}${apiErrorNote} (HTTP ${res.status})`
         : `MSG91 WhatsApp send failed (HTTP ${res.status}): ${JSON.stringify(json)}`
     );
+    // Lets callers (isTransientWhatsappError) classify retryable (429/5xx)
+    // vs. permanent failures programmatically instead of parsing the message.
+    (err as any).httpStatus = res.status;
+    throw err;
   }
 
   return {
