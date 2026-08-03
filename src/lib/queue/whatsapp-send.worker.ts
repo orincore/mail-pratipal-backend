@@ -32,7 +32,12 @@ async function processWhatsappSend(job: { data: WhatsappSendJobData }): Promise<
     WebinarReminder.findById(reminderId),
     EmailSubscriber.findById(subscriberId),
   ]);
-  if (!reminder || !subscriber || subscriber.status !== "subscribed" || !subscriber.email) return;
+  // status ("subscribed"/"unsubscribed"/"bounced"/"complained") is an
+  // EMAIL-channel concept — see fan-out.ts's pendingSubscribersForLeg for why
+  // WhatsApp sends don't gate on it. Re-checking it here would silently drop
+  // every job fan-out just deliberately enqueued for a non-"subscribed"
+  // recipient, undoing that fix.
+  if (!reminder || !subscriber || !subscriber.email) return;
 
   const webinar = await Webinar.findById(reminder.webinar_id);
   if (!webinar || webinar.status === "cancelled") return;

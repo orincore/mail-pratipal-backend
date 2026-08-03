@@ -23,7 +23,8 @@ export type WhatsappTemplateName =
   | "webinar_starting_soon"
   | "webinar_live_now"
   | "webinar_cancelled"
-  | "webinar_rescheduled";
+  | "webinar_rescheduled"
+  | "webinar_correction";
 
 export interface WhatsappTemplateDef {
   name: WhatsappTemplateName;
@@ -72,6 +73,12 @@ export const WHATSAPP_TEMPLATES: WhatsappTemplateDef[] = [
     name: "event_notify",
     label: "Event Reminder (generic)",
     description: "Generic fallback — text-only, no button. Available to pick manually but no longer any preset's default now that the specific templates are approved.",
+    hasButton: false,
+  },
+  {
+    name: "webinar_correction",
+    label: "Cancellation Correction",
+    description: "For the rare case a cancellation notice went out in error — clarifies the webinar is still happening on its original date and the earlier cancellation message should be disregarded. Manual-only (no automatic trigger); send via a Campaign targeting this webinar's registrant tag. Requires MSG91/Meta approval before it can actually send — see docs/whatsapp-templates.md.",
     hasButton: false,
   },
 ];
@@ -154,6 +161,8 @@ export function buildWhatsappTemplateParams(
     case "webinar_cancelled":
       return { bodyParams: [data.firstName, data.webinarTitle, data.originalDate ? formatDate(data.originalDate, data.timezone) : date] };
     case "webinar_rescheduled":
+      return { bodyParams: [data.firstName, data.webinarTitle, date, time, data.timezone] };
+    case "webinar_correction":
       return { bodyParams: [data.firstName, data.webinarTitle, date, time, data.timezone] };
     default:
       return { bodyParams: [] };

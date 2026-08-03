@@ -7,11 +7,18 @@ import { config } from "../../config";
 
 export type ReminderChannel = "email" | "whatsapp";
 
-// Identical "who hasn't received this yet" query the old sweep used —
-// tagged for this webinar occurrence, subscribed, and no "sent" EmailEvent
-// for this reminder+channel. Not reinvented, just relocated.
+// "subscribed" is an EMAIL deliverability/consent flag — set to
+// "unsubscribed"/"bounced"/"complained" by email-specific events (an
+// unsubscribe link click, an SES bounce/complaint webhook). None of those
+// have any bearing on WhatsApp: a bounced email address or a past email
+// unsubscribe doesn't mean the person opted out of WhatsApp, and blocking
+// WhatsApp sends on it was why a webinar with 407 registrants only reached
+// 281 on WhatsApp too, not just email — the whatsapp leg was silently gated
+// by an unrelated email-channel status. Only the email leg honors it.
 async function pendingSubscribersForLeg(reminderId: any, tag: string, channel: ReminderChannel) {
-  const subscribers = await EmailSubscriber.find({ status: "subscribed", tags: tag });
+  const query: Record<string, any> = { tags: tag };
+  if (channel === "email") query.status = "subscribed";
+  const subscribers = await EmailSubscriber.find(query);
   const sentTo = await EmailEvent.find({
     reminder_id: reminderId,
     channel,

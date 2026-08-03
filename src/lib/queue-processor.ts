@@ -41,11 +41,21 @@ export async function runQueueSweep(trackingUrl: string) {
 
 /**
  * Resolves a campaign's audience definition to the list of currently
- * subscribed recipients. Supports "all", lists/tags matching, and saved
- * segments.
+ * eligible recipients for the given channel. Supports "all", lists/tags
+ * matching, and saved segments.
+ *
+ * `status` ("subscribed"/"unsubscribed"/"bounced"/"complained") is an EMAIL
+ * deliverability/consent flag set by email-specific events (unsubscribe link,
+ * SES bounce/complaint webhook) — it has no bearing on WhatsApp, so only the
+ * email leg filters on it. Gating WhatsApp on it too used to silently drop
+ * anyone who'd ever unsubscribed/bounced/complained on an unrelated past
+ * email from receiving WhatsApp sends they were otherwise eligible for.
  */
-async function resolveAudienceSubscribers(audience: any): Promise<any[] | null> {
-  const baseQuery: any = { status: "subscribed" };
+async function resolveAudienceSubscribers(
+  audience: any,
+  channel: "email" | "whatsapp"
+): Promise<any[] | null> {
+  const baseQuery: any = channel === "email" ? { status: "subscribed" } : {};
 
   if (audience?.segment_id) {
     const segment = await Segment.findById(audience.segment_id);
@@ -194,7 +204,7 @@ async function sendEmailLegForCampaign(campaign: any, provider: any, trackingUrl
     templateB = (await EmailTemplate.findById(claimed.ab_test.template_id_b)) || templateA;
   }
 
-  const subscribers = await resolveAudienceSubscribers(claimed.audience);
+  const subscribers = await resolveAudienceSubscribers(claimed.audience, "email");
   if (subscribers === null) {
     claimed.dispatch_status = "sent";
     await claimed.save();
@@ -317,7 +327,7 @@ async function sendWhatsappLegForCampaign(campaign: any) {
     return { status: "skipped", error: "No whatsapp_template set" };
   }
 
-  const subscribers = await resolveAudienceSubscribers(claimed.audience);
+  const subscribers = await resolveAudienceSubscribers(claimed.audience, "whatsapp");
   if (subscribers === null) {
     claimed.whatsapp_dispatch_status = "sent";
     await claimed.save();

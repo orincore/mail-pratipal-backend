@@ -52,6 +52,18 @@ async function registrantCount(webinar: { source_window_id: string }) {
   return EmailSubscriber.countDocuments({ tags: webinarTag(webinar) });
 }
 
+// Registrant count above is everyone tagged for this occurrence, regardless
+// of EmailSubscriber.status — a global email consent/deliverability flag
+// that can be "unsubscribed"/"bounced"/"complained" from something entirely
+// unrelated to this webinar (see fan-out.ts's pendingSubscribersForLeg for
+// why WhatsApp doesn't gate on it, but email intentionally still does). This
+// gives the dashboard the real number email reminders will reach, so a
+// registrant count that includes people who will never get an email doesn't
+// read as a delivery failure.
+async function emailEligibleCount(webinar: { source_window_id: string }) {
+  return EmailSubscriber.countDocuments({ tags: webinarTag(webinar), status: "subscribed" });
+}
+
 // GET /api/webinars/meta/whatsapp-templates - MSG91-synced template metadata for the reminder UI
 router.get("/meta/whatsapp-templates", async (_req: AuthenticatedRequest, res: Response) => {
   const templates = await getMergedWhatsappTemplates();
@@ -69,11 +81,12 @@ router.get("/", async (req: AuthenticatedRequest, res: Response) => {
 
     const withDetails = await Promise.all(
       webinars.map(async (w: any) => {
-        const [reminders, count] = await Promise.all([
+        const [reminders, count, emailEligible] = await Promise.all([
           WebinarReminder.find({ webinar_id: w._id }).sort({ computed_send_at: 1 }).lean(),
           registrantCount(w),
+          emailEligibleCount(w),
         ]);
-        return { ...w, id: w._id.toString(), reminders, registrant_count: count };
+        return { ...w, id: w._id.toString(), reminders, registrant_count: count, email_eligible_count: emailEligible };
       })
     );
 
@@ -107,14 +120,15 @@ router.get("/:id", async (req: AuthenticatedRequest, res: Response) => {
       return res.status(404).json({ error: "Webinar not found" });
     }
 
-    const [reminders, registrants, count] = await Promise.all([
+    const [reminders, registrants, count, emailEligible] = await Promise.all([
       WebinarReminder.find({ webinar_id: webinar._id }).sort({ computed_send_at: 1 }),
       EmailSubscriber.find({ tags: webinarTag(webinar) }).select("email first_name status created_at"),
       registrantCount(webinar),
+      emailEligibleCount(webinar),
     ]);
 
     return res.json({
-      webinar: { ...webinar, id: webinar._id.toString(), registrant_count: count },
+      webinar: { ...webinar, id: webinar._id.toString(), registrant_count: count, email_eligible_count: emailEligible },
       reminders,
       registrants,
     });

@@ -194,6 +194,36 @@ Hi {{1}}, *{{2}}* has been rescheduled to {{3}} at {{4}} ({{5}}). Your registrat
 
 ---
 
+## 5b. `webinar_correction`
+
+**Trigger:** manual only — there's no automatic trigger for this one. For the
+rare case an admin cancels a webinar by mistake (or a bug sends the
+cancellation notice in error): send this via a Campaign whose audience is
+`tags: [webinar-window:<Webinar.source_window_id>]` (the same tag every
+registrant for that occurrence carries), so it reaches everyone who got the
+erroneous cancellation. **Not yet approved in MSG91** — create it there
+(Category: Utility, language `en`) with the exact body below and submit for
+Meta review before it can actually send; until approved, sends will fail
+per-recipient the same way any not-yet-approved template does (logged, not
+thrown — doesn't block the campaign's email leg).
+
+**Body:**
+```
+Hi {{1}}, please disregard the earlier cancellation message for *{{2}}* — it was sent in error. The webinar is going ahead as scheduled on {{3}} at {{4}} ({{5}}). We're sorry for the confusion.
+```
+
+| Var | Meaning | Source |
+|---|---|---|
+| `{{1}}` | First name | registrant record |
+| `{{2}}` | Webinar title | `Webinar.title` |
+| `{{3}}` | Date | `Webinar.starts_at` in `Webinar.timezone` (unchanged — nothing was actually rescheduled) |
+| `{{4}}` | Time | `Webinar.starts_at` in `Webinar.timezone` |
+| `{{5}}` | Timezone label | `Webinar.timezone` |
+
+**Buttons:** none
+
+---
+
 ## Recipient phone number
 
 `whatsapp_number` is captured on the signup form (`InvitationRequest.whatsapp_number`)

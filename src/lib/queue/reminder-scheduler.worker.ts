@@ -2,6 +2,7 @@ import { Worker } from "bullmq";
 import WebinarReminder from "../../models/WebinarReminder";
 import Webinar from "../../models/Webinar";
 import { fanOutReminderLeg } from "./fan-out";
+import { syncRegistrantsForWebinar } from "../webinar-sync";
 import { redisConnection, queuePrefix } from "./connection";
 import { reminderSchedulerQueue, scheduleReminderJob, reminderJobId } from "./queues";
 
@@ -26,10 +27,29 @@ async function handleDispatch(reminderId: string): Promise<void> {
   }
   if (webinar.status !== "upcoming") return;
 
-  if (["pending", "sending"].includes(reminder.dispatch_status)) {
+  const dispatchingEmail = ["pending", "sending"].includes(reminder.dispatch_status);
+  const dispatchingWhatsapp = ["pending", "sending"].includes(reminder.whatsapp_dispatch_status);
+  if (!dispatchingEmail && !dispatchingWhatsapp) return;
+
+  // Registrant tagging only otherwise happens on the manual "Sync Now"
+  // button or right before a manual "Send Instantly" — a reminder firing on
+  // its own delayed timer (the normal path, for every scheduled reminder)
+  // never refreshed the registrant list itself. Since people keep
+  // registering right up to send time, that meant a reminder due to fire
+  // for e.g. 407 currently-registered people would only actually reach
+  // whoever had been tagged as of the last manual sync — sometimes hours
+  // stale — silently under-notifying the rest with no error or indication
+  // anything was missed. force=true bypasses the normal 5-min sync
+  // throttle so this pulls the truly current list right before sending,
+  // not a stale in-window skip. A fetch failure here is swallowed inside
+  // syncRegistrantsForWebinar itself (logged, not thrown) — dispatch still
+  // proceeds against whatever's already tagged, same as before this fix.
+  await syncRegistrantsForWebinar(webinar, true);
+
+  if (dispatchingEmail) {
     await fanOutReminderLeg(reminder, webinar, "email");
   }
-  if (["pending", "sending"].includes(reminder.whatsapp_dispatch_status)) {
+  if (dispatchingWhatsapp) {
     await fanOutReminderLeg(reminder, webinar, "whatsapp");
   }
 }
