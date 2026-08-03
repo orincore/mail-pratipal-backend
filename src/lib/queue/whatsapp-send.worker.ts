@@ -37,6 +37,20 @@ async function processWhatsappSend(job: { data: WhatsappSendJobData }): Promise<
   const webinar = await Webinar.findById(reminder.webinar_id);
   if (!webinar || webinar.status === "cancelled") return;
 
+  // Hard guard, checked immediately before actually sending — not just at
+  // enqueue time (fan-out.ts's pendingSubscribersForLeg). A retried job, a
+  // re-triggered fan-out sweep, or a concurrent worker can all reach this
+  // point for a recipient who already has a recorded "sent" event; without
+  // this check they'd get the WhatsApp message a second time regardless of
+  // how the duplicate job arose.
+  const alreadySent = await EmailEvent.exists({
+    reminder_id: reminder._id,
+    recipient_email: subscriber.email.toLowerCase(),
+    channel: "whatsapp",
+    event_type: "sent",
+  });
+  if (alreadySent) return;
+
   if (!subscriber.whatsapp_number) {
     await EmailEvent.create({
       reminder_id: reminder._id,
@@ -71,15 +85,25 @@ async function processWhatsappSend(job: { data: WhatsappSendJobData }): Promise<
       buttonUrlSuffix,
     });
 
-    await EmailEvent.create({
-      reminder_id: reminder._id,
-      recipient_email: subscriber.email.toLowerCase(),
-      channel: "whatsapp",
-      event_type: "sent",
-      timestamp: new Date(),
-      details: { messageId: result.messageId },
-    });
-    await WebinarReminder.updateOne({ _id: reminder._id }, { $inc: { "stats.whatsapp_sent": 1 } });
+    try {
+      await EmailEvent.create({
+        reminder_id: reminder._id,
+        recipient_email: subscriber.email.toLowerCase(),
+        channel: "whatsapp",
+        event_type: "sent",
+        timestamp: new Date(),
+        details: { messageId: result.messageId },
+      });
+      await WebinarReminder.updateOne({ _id: reminder._id }, { $inc: { "stats.whatsapp_sent": 1 } });
+    } catch (recordErr: any) {
+      // The message already went out above — a duplicate-key error here just
+      // means a concurrent attempt for this same recipient recorded "sent"
+      // first (the EmailEvent unique index catching a race the earlier
+      // alreadySent check missed by a hair). It is NOT a send failure, so
+      // don't fall into the catch below and log a bogus "failed" event on
+      // top of a message that was actually delivered.
+      if (recordErr?.code !== 11000) throw recordErr;
+    }
   } catch (err: any) {
     await EmailEvent.create({
       reminder_id: reminder._id,

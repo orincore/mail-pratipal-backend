@@ -18,8 +18,10 @@ export interface SchedulableReminder {
 }
 
 // BullMQ rejects custom job IDs containing ":" (reserved as its own Redis key
-// separator) — hyphens throughout instead.
-function reminderJobId(reminderId: any): string {
+// separator) — hyphens throughout instead. Exported so every caller that
+// needs to look up this job (e.g. the reconcile backstop) derives the same
+// string instead of hand-rolling it and drifting out of sync.
+export function reminderJobId(reminderId: any): string {
   return `reminder-${reminderId}`;
 }
 

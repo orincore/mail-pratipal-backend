@@ -3,7 +3,7 @@ import WebinarReminder from "../../models/WebinarReminder";
 import Webinar from "../../models/Webinar";
 import { fanOutReminderLeg } from "./fan-out";
 import { redisConnection, queuePrefix } from "./connection";
-import { reminderSchedulerQueue, scheduleReminderJob } from "./queues";
+import { reminderSchedulerQueue, scheduleReminderJob, reminderJobId } from "./queues";
 
 interface DispatchJobData {
   reminderId: string;
@@ -38,18 +38,32 @@ async function handleDispatch(reminderId: string): Promise<void> {
 // persistence (Redis AOF) + stalled-job recovery handles most restart
 // scenarios natively. This catches the narrower case of a reminder that's
 // due but was never actually enqueued (a bug, or genuine Redis data loss).
+//
+// Only "pending" (never claimed by fanOutReminderLeg) legs qualify — NOT
+// "sending". This used to also match "sending", combined with a jobId typo
+// below (`reminder:` vs. the real `reminder-` format from reminderJobId())
+// that made the "already scheduled" guard never match anything. Since the
+// scheduler's own dispatch job removes itself the instant handleDispatch
+// returns (removeOnComplete: true) — which happens almost immediately, well
+// before a large recipient list finishes draining through the rate limiter —
+// that combination meant this backstop refired handleDispatch for every
+// still-draining "sending" leg on every 5-minute tick, each time
+// re-running fanOutReminderLeg while the previous fan-out was still in
+// flight. This was the root cause of a production incident where a single
+// webinar reminder's WhatsApp leg was redispatched repeatedly and recipients
+// received the same message far more than once. "sending" means fan-out has
+// already claimed the leg and enqueued jobs for it — that in-flight work (or
+// the reminder-finalize job once it settles) is what should carry it to
+// "sent", not another reconcile-triggered fan-out pass.
 export async function reconcileDueReminders(): Promise<void> {
   const due = await WebinarReminder.find({
     status: "active",
     computed_send_at: { $lte: new Date() },
-    $or: [
-      { dispatch_status: { $in: ["pending", "sending"] } },
-      { whatsapp_dispatch_status: { $in: ["pending", "sending"] } },
-    ],
+    $or: [{ dispatch_status: "pending" }, { whatsapp_dispatch_status: "pending" }],
   });
 
   for (const reminder of due) {
-    const existing = await reminderSchedulerQueue.getJob(`reminder:${reminder._id}`);
+    const existing = await reminderSchedulerQueue.getJob(reminderJobId(reminder._id));
     if (!existing) {
       // Re-enqueuing a reminder that's actually already fully sent is a
       // cheap no-op — fanOutReminderLeg's pending-audience query comes back

@@ -32,6 +32,18 @@ async function processEmailSend(job: { data: EmailSendJobData }): Promise<void> 
   const webinar = await Webinar.findById(reminder.webinar_id);
   if (!webinar || webinar.status === "cancelled") return;
 
+  // Hard guard, checked immediately before actually sending — mirrors the
+  // same check in whatsapp-send.worker.ts. See that file for why a retried
+  // job or re-triggered fan-out sweep needs this in addition to fan-out.ts's
+  // enqueue-time filter.
+  const alreadySent = await EmailEvent.exists({
+    reminder_id: reminder._id,
+    recipient_email: subscriber.email.toLowerCase(),
+    channel: "email",
+    event_type: "sent",
+  });
+  if (alreadySent) return;
+
   const template = await EmailTemplate.findById(reminder.template_id);
   if (!template) {
     throw new UnrecoverableError(`Template ${reminder.template_id} not found for reminder ${reminderId}`);
@@ -76,15 +88,22 @@ async function processEmailSend(job: { data: EmailSendJobData }): Promise<void> 
       headers: buildListUnsubscribeHeaders(trackingUrl, subscriber.email, source),
     });
 
-    await EmailEvent.create({
-      reminder_id: reminder._id,
-      recipient_email: subscriber.email.toLowerCase(),
-      channel: "email",
-      event_type: "sent",
-      timestamp: new Date(),
-      details: { messageId },
-    });
-    await WebinarReminder.updateOne({ _id: reminder._id }, { $inc: { "stats.sent": 1 } });
+    try {
+      await EmailEvent.create({
+        reminder_id: reminder._id,
+        recipient_email: subscriber.email.toLowerCase(),
+        channel: "email",
+        event_type: "sent",
+        timestamp: new Date(),
+        details: { messageId },
+      });
+      await WebinarReminder.updateOne({ _id: reminder._id }, { $inc: { "stats.sent": 1 } });
+    } catch (recordErr: any) {
+      // See whatsapp-send.worker.ts's identical guard — a duplicate-key hit
+      // here means the email already went out, just don't double-log it as
+      // a failure.
+      if (recordErr?.code !== 11000) throw recordErr;
+    }
   } catch (err: any) {
     await EmailEvent.create({
       reminder_id: reminder._id,

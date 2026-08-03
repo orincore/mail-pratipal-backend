@@ -127,12 +127,38 @@ router.get("/:id", async (req: AuthenticatedRequest, res: Response) => {
 // PUT /api/webinars/:id - update status (e.g. cancel), cascades to pending reminders
 router.put("/:id", async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const { status } = req.body;
+    const { status, notify } = req.body;
     if (!status || !["upcoming", "completed", "cancelled"].includes(status)) {
       return res.status(400).json({ error: "Invalid status" });
     }
+    // Defaults to true so existing callers that don't pass `notify` keep
+    // their current behavior — the frontend cancel modal now sends this
+    // explicitly (checked by default, uncheckable for a silent cancel).
+    const shouldNotify = notify !== false;
 
-    const webinar = await Webinar.findByIdAndUpdate(req.params.id, { $set: { status } }, { new: true });
+    const existing = await Webinar.findById(req.params.id);
+    if (!existing) {
+      return res.status(404).json({ error: "Webinar not found" });
+    }
+    // Re-cancelling an already-cancelled webinar (a double-click, a client
+    // retry after a slow/timed-out first request, or simply hitting the
+    // endpoint twice) used to unconditionally re-run the entire cascade
+    // below, including re-blasting a WhatsApp "cancelled" notice to every
+    // registrant with no per-recipient dedup at all — the root cause of a
+    // production incident where registrants got the same notice repeatedly.
+    // If the status isn't actually changing, this is a no-op.
+    if (existing.status === status) {
+      return res.json({ webinar: existing });
+    }
+
+    // Reactivating clears the notified flag so a genuine future cancellation
+    // of this same occurrence sends its own fresh notice rather than being
+    // silently suppressed by a stale flag from the earlier cancellation.
+    const mongoUpdate: Record<string, any> =
+      status === "upcoming"
+        ? { $set: { status }, $unset: { cancellation_notified_at: 1 } }
+        : { $set: { status } };
+    const webinar = await Webinar.findByIdAndUpdate(req.params.id, mongoUpdate, { new: true });
     if (!webinar) {
       return res.status(404).json({ error: "Webinar not found" });
     }
@@ -155,20 +181,28 @@ router.put("/:id", async (req: AuthenticatedRequest, res: Response) => {
       const affectedReminders = await WebinarReminder.find({ webinar_id: webinar._id }).select("_id");
       await Promise.all(affectedReminders.map((r: any) => cancelReminderJob(r._id)));
 
-      // Notify everyone already registered for this occurrence.
-      const tag = webinarTag(webinar);
-      const subscribers = await EmailSubscriber.find({
-        tags: tag,
-        whatsapp_number: { $exists: true, $ne: null },
-      }).lean();
-      for (const sub of subscribers) {
-        if (!sub.whatsapp_number) continue;
-        await sendLifecycleWhatsapp(
-          "webinar_cancelled",
-          sub.whatsapp_number,
-          { firstName: sub.first_name || "there", webinarTitle: webinar.title, startsAt: webinar.starts_at, timezone: webinar.timezone },
-          sub.email
-        );
+      // Notify everyone already registered for this occurrence — unless the
+      // caller explicitly asked for a silent cancel, or this occurrence was
+      // already notified (belt-and-suspenders alongside the status-unchanged
+      // guard above, in case two cancel requests raced each other before
+      // either one's findByIdAndUpdate had landed).
+      if (shouldNotify && !webinar.cancellation_notified_at) {
+        const tag = webinarTag(webinar);
+        const subscribers = await EmailSubscriber.find({
+          tags: tag,
+          whatsapp_number: { $exists: true, $ne: null },
+        }).lean();
+        for (const sub of subscribers) {
+          if (!sub.whatsapp_number) continue;
+          await sendLifecycleWhatsapp(
+            "webinar_cancelled",
+            sub.whatsapp_number,
+            { firstName: sub.first_name || "there", webinarTitle: webinar.title, startsAt: webinar.starts_at, timezone: webinar.timezone },
+            sub.email
+          );
+        }
+        webinar.cancellation_notified_at = new Date();
+        await webinar.save();
       }
     }
 

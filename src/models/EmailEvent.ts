@@ -60,4 +60,20 @@ EmailEventSchema.index({ reminder_id: 1, event_type: 1 });
 EmailEventSchema.index({ recipient_email: 1, timestamp: -1 });
 EmailEventSchema.index({ timestamp: -1 });
 
+// Hard DB-level backstop against duplicate sends: at most one "sent" event
+// per (reminder, recipient, channel) or (campaign, recipient, channel). The
+// application-level "already sent?" checks upstream (fan-out.ts,
+// whatsapp-send.worker.ts, email-send.worker.ts) are check-then-act and can
+// race under concurrent workers/retries/reconcile sweeps — this index turns
+// a lost race into a harmless duplicate-key error instead of a second real
+// send already having gone out.
+EmailEventSchema.index(
+  { reminder_id: 1, recipient_email: 1, channel: 1 },
+  { unique: true, partialFilterExpression: { event_type: "sent", reminder_id: { $exists: true } } }
+);
+EmailEventSchema.index(
+  { campaign_id: 1, recipient_email: 1, channel: 1 },
+  { unique: true, partialFilterExpression: { event_type: "sent", campaign_id: { $exists: true } } }
+);
+
 export default mongoose.models.EmailEvent || mongoose.model<IEmailEvent>("EmailEvent", EmailEventSchema);

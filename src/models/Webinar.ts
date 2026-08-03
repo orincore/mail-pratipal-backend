@@ -17,6 +17,11 @@ export interface IWebinar extends Document {
   join_link?: string;
   join_platform?: "zoom" | "google_meet" | "teams" | "other";
   last_synced_at?: Date;
+  /** Set once the "webinar_cancelled" WhatsApp/email notice has actually gone
+   * out to registrants — guards against re-sending it on a repeat PUT
+   * (double-click, client retry, or re-cancelling an already-cancelled
+   * webinar) rather than relying solely on the request being called once. */
+  cancellation_notified_at?: Date;
   created_at: Date;
   updated_at: Date;
 }
@@ -39,6 +44,7 @@ const WebinarSchema = new Schema<IWebinar>(
     join_link: { type: String },
     join_platform: { type: String, enum: ["zoom", "google_meet", "teams", "other"] },
     last_synced_at: { type: Date },
+    cancellation_notified_at: { type: Date },
   },
   {
     timestamps: { createdAt: "created_at", updatedAt: "updated_at" },
