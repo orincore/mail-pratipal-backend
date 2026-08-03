@@ -26,28 +26,56 @@ interface RemoteTemplate {
 const CACHE_TTL_MS = 10 * 60 * 1000;
 let cache: { at: number; templates: MergedWhatsappTemplate[] } | null = null;
 
+// Per https://docs.msg91.com/whatsapp/get-templates — a completely different
+// host and path from what this used to hit (api.msg91.com/.../whatsapp-template/
+// is not this endpoint at all, which is why remote sync silently always fell
+// back to the local registry). Real endpoint: GET
+// control.msg91.com/api/v5/whatsapp/get-template-client/:number, :number
+// being the digits-only integrated WhatsApp number as a path segment, not a
+// query param. Omitting template_name/template_status/template_language/
+// pagination entirely (rather than passing them empty) gets the full
+// non-paginated list per the docs ("if any one of the parameters is missing
+// or passed as an empty string, the API response will return non-paginated
+// data") — capped at 500 templates, far more than this app will ever have.
 async function fetchRemoteTemplates(): Promise<RemoteTemplate[]> {
   const { authKey, integratedNumber } = config.whatsapp.msg91;
   if (!authKey || !integratedNumber) return [];
 
   const digits = integratedNumber.replace(/[^\d]/g, "");
   const res = await fetch(
-    `https://api.msg91.com/api/v5/whatsapp/whatsapp-template/${digits}`,
-    { headers: { authkey: authKey } }
+    `https://control.msg91.com/api/v5/whatsapp/get-template-client/${digits}`,
+    {
+      headers: {
+        accept: "application/json",
+        authkey: authKey,
+        // Documented header for this GET, despite there being no body — MSG91's
+        // own curl example sends it, so matching it rather than guessing it's safe to drop.
+        "content-type": "text/plain",
+      },
+    }
   );
   if (!res.ok) {
     throw new Error(`MSG91 template list fetch failed (HTTP ${res.status})`);
   }
 
   const json: any = await res.json().catch(() => ({}));
-  // MSG91's envelope isn't formally documented — accept the common shapes
-  // ({ data: [...] } or a bare array) and ignore anything unrecognized.
-  const rows: any[] = Array.isArray(json) ? json : Array.isArray(json?.data) ? json.data : [];
+  // MSG91's docs give no real example of the response body (their own sample
+  // is a literal "{}") — accept the shapes seen in practice ({ data: [...] },
+  // { templates: [...] }, or a bare array) and ignore anything unrecognized
+  // rather than throwing, since a shape mismatch here must degrade to the
+  // local registry, not break the admin UI.
+  const rows: any[] = Array.isArray(json)
+    ? json
+    : Array.isArray(json?.data)
+    ? json.data
+    : Array.isArray(json?.templates)
+    ? json.templates
+    : [];
 
   return rows
     .map((row) => ({
       name: String(row?.name || row?.template_name || "").trim(),
-      status: row?.status ? String(row.status) : undefined,
+      status: row?.status || row?.template_status ? String(row.status || row.template_status) : undefined,
     }))
     .filter((row) => row.name.length > 0);
 }
