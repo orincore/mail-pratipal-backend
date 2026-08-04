@@ -3,6 +3,13 @@ import mongoose, { Schema, Document } from "mongoose";
 export interface IEmailEvent extends Document {
   campaign_id?: mongoose.Types.ObjectId;
   reminder_id?: mongoose.Types.ObjectId;
+  webinar_id?: mongoose.Types.ObjectId;
+  /**
+   * Dedup key for webinar lifecycle WhatsApp notices (cancellation/reschedule),
+   * e.g. "webinar_cancelled" or "webinar_rescheduled:<new ISO start>". Scoped
+   * per webinar occurrence via webinar_id — see the unique index below.
+   */
+  lifecycle_event?: string;
   recipient_email: string;
   /** Which channel this event belongs to — defaults to "email" for all pre-existing rows. */
   channel: "email" | "whatsapp";
@@ -26,6 +33,8 @@ const EmailEventSchema = new Schema<IEmailEvent>(
   {
     campaign_id: { type: Schema.Types.ObjectId, ref: "EmailCampaign", index: true },
     reminder_id: { type: Schema.Types.ObjectId, ref: "WebinarReminder", index: true },
+    webinar_id: { type: Schema.Types.ObjectId, ref: "Webinar", index: true },
+    lifecycle_event: { type: String },
     recipient_email: { type: String, required: true, index: true },
     channel: { type: String, enum: ["email", "whatsapp"], default: "email", index: true },
     event_type: {
@@ -74,6 +83,17 @@ EmailEventSchema.index(
 EmailEventSchema.index(
   { campaign_id: 1, recipient_email: 1, channel: 1 },
   { unique: true, partialFilterExpression: { event_type: "sent", campaign_id: { $exists: true } } }
+);
+// Same backstop for webinar lifecycle notices (cancellation/reschedule sent
+// via sendLifecycleWhatsapp): at most one "sent" per (webinar occurrence,
+// lifecycle key, recipient). These sends are claim-first — the row is
+// inserted BEFORE hitting MSG91, so two processes syncing the same webinar
+// concurrently (the API server's Sync Now and the queue worker's pre-dispatch
+// force sync) can't both blast the same notice: the loser gets a duplicate-key
+// error and skips.
+EmailEventSchema.index(
+  { webinar_id: 1, lifecycle_event: 1, recipient_email: 1 },
+  { unique: true, partialFilterExpression: { event_type: "sent", lifecycle_event: { $exists: true } } }
 );
 
 export default mongoose.models.EmailEvent || mongoose.model<IEmailEvent>("EmailEvent", EmailEventSchema);

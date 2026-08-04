@@ -212,7 +212,10 @@ router.put("/:id", async (req: AuthenticatedRequest, res: Response) => {
             "webinar_cancelled",
             sub.whatsapp_number,
             { firstName: sub.first_name || "there", webinarTitle: webinar.title, startsAt: webinar.starts_at, timezone: webinar.timezone },
-            sub.email
+            // Per-recipient DB-level dedup on top of cancellation_notified_at:
+            // two racing cancel requests can both pass the flag check, but
+            // only one can claim each recipient's unique EmailEvent row.
+            { webinarId: webinar._id, recipientEmail: sub.email, key: "webinar_cancelled" }
           );
         }
         webinar.cancellation_notified_at = new Date();

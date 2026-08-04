@@ -54,14 +54,15 @@ occurrence. The redirect route lives at
 
 ## 1. `webinar_registration_confirmation`
 
-**Trigger:** `syncRegistrantsForWebinar()` in `src/lib/webinar-sync.ts` — fired the
-first time a registrant's email gets `webinarTag(webinar)` added (i.e. genuinely
-new to *this occurrence*, even if they're an existing `EmailSubscriber` from an
-earlier run of the same webinar). Since registrant sync is polled (throttled to
-once per 5 min per webinar, driven by the worker's 10s loop), this lands within
-~5 minutes of signup, not instantly — it augments the website's existing
-email-only confirmation (`Pratipal Website/src/app/api/invitations/route.ts`),
-which still fires immediately and is unchanged.
+**Trigger:** manual only — selectable as a reminder template (e.g. via Send
+Instantly). No longer sent automatically: `syncRegistrantsForWebinar()` used to
+fire it for every registrant not yet tagged with `webinarTag(webinar)`, which
+re-blasted the entire registrant list on the first sync of a window (or after
+any tag reset) and duplicated the instant `invitation_registration_confirmed`
+the website already sends at the moment of registration
+(`Pratipal Website/src/app/api/invitations/route.ts` →
+`POST /api/notifications/whatsapp/send`). That instant send is the registrant's
+confirmation.
 
 **Body:**
 ```

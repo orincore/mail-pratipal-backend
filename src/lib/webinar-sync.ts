@@ -1,6 +1,7 @@
 import Webinar from "../models/Webinar";
 import WebinarReminder from "../models/WebinarReminder";
 import EmailSubscriber from "../models/EmailSubscriber";
+import EmailEvent from "../models/EmailEvent";
 import { config } from "../config";
 import { sendWhatsappTemplate } from "../providers/msg91-whatsapp.provider";
 import { buildWhatsappTemplateParams } from "./whatsapp-templates";
@@ -9,20 +10,65 @@ import { scheduleReminderJob } from "./queue/queues";
 
 export { normalizeWhatsappNumber };
 
-// Shared by the registration-confirmation, cancellation, and reschedule
-// notices below — logs and swallows a send failure for one recipient rather
-// than letting it interrupt the sync loop for everyone else.
+export interface LifecycleDedup {
+  webinarId: any;
+  recipientEmail: string;
+  /** e.g. "webinar_cancelled", or "webinar_rescheduled:<new ISO start>" so a
+   * genuine second reschedule still notifies while the same one never
+   * double-sends. */
+  key: string;
+}
+
+// Shared by the cancellation and reschedule notices below — logs and swallows
+// a send failure for one recipient rather than letting it interrupt the sync
+// loop for everyone else.
+//
+// Idempotent per (webinar, dedup key, recipient), enforced by EmailEvent's
+// partial unique index. Claim-FIRST: the "sent" row is inserted before the
+// MSG91 call, so concurrent syncs from different processes (the API server's
+// Sync Now vs. the queue worker's pre-dispatch force sync) can't both send —
+// this exact race is how registrants used to receive the same lifecycle
+// WhatsApp message multiple times. If the send then fails, the claim is
+// rolled back so a later sync can retry.
 export async function sendLifecycleWhatsapp(
-  templateName: "webinar_registration_confirmation" | "webinar_cancelled" | "webinar_rescheduled",
+  templateName: "webinar_cancelled" | "webinar_rescheduled",
   to: string,
   data: Parameters<typeof buildWhatsappTemplateParams>[1],
-  context: string
+  dedup: LifecycleDedup
 ): Promise<void> {
+  const recipient_email = dedup.recipientEmail.toLowerCase();
   try {
-    const { bodyParams, buttonUrlSuffix } = buildWhatsappTemplateParams(templateName, data);
-    await sendWhatsappTemplate({ to, templateName, bodyParams, buttonUrlSuffix });
+    try {
+      await EmailEvent.create({
+        webinar_id: dedup.webinarId,
+        lifecycle_event: dedup.key,
+        recipient_email,
+        channel: "whatsapp",
+        event_type: "sent",
+        timestamp: new Date(),
+        details: { template: templateName },
+      });
+    } catch (claimErr: any) {
+      // Duplicate key: another sync already sent (or is sending) this exact
+      // notice to this recipient — skip silently.
+      if (claimErr?.code === 11000) return;
+      throw claimErr;
+    }
+
+    try {
+      const { bodyParams, buttonUrlSuffix } = buildWhatsappTemplateParams(templateName, data);
+      await sendWhatsappTemplate({ to, templateName, bodyParams, buttonUrlSuffix });
+    } catch (sendErr) {
+      await EmailEvent.deleteOne({
+        webinar_id: dedup.webinarId,
+        lifecycle_event: dedup.key,
+        recipient_email,
+        event_type: "sent",
+      }).catch(() => {});
+      throw sendErr;
+    }
   } catch (err) {
-    console.error(`${templateName} WhatsApp send failed (${context}):`, err);
+    console.error(`${templateName} WhatsApp send failed (${recipient_email}):`, err);
   }
 }
 
@@ -149,7 +195,10 @@ export async function syncWebinarsFromWebsite(force = false): Promise<void> {
             "webinar_rescheduled",
             sub.whatsapp_number,
             { firstName: sub.first_name || "there", webinarTitle: webinar.title, startsAt: newStartsAt, timezone: webinar.timezone },
-            sub.email
+            // Keyed by the NEW start time: a second genuine reschedule sends
+            // its own notice, but re-running sync (or a racing concurrent
+            // sync) for the same reschedule never re-sends this one.
+            { webinarId: webinar._id, recipientEmail: sub.email, key: `webinar_rescheduled:${newStartsAt.toISOString()}` }
           );
         }
       }
@@ -187,16 +236,8 @@ export async function syncRegistrantsForWebinar(webinar: any, force = false): Pr
   // awaited sequentially — with several hundred registrants per window and
   // "Sync Now" force-syncing every upcoming webinar in one request, that was
   // ~2 DB round-trips per registrant (thousands total), which is what made
-  // the dashboard's Sync Now button hang. Batched instead: one query to find
-  // who's already tagged for this window (to preserve "only message genuinely
-  // new registrants" semantics) and one bulkWrite for all the upserts.
-  const alreadyTaggedEmails = new Set(
-    (await EmailSubscriber.find({ tags: tag }).select("email").lean()).map((s: any) =>
-      (s.email || "").toLowerCase()
-    )
-  );
-
-  const newlyRegistered: { email: string; first_name?: string; whatsapp_number?: string }[] = [];
+  // the dashboard's Sync Now button hang. Batched instead: one bulkWrite for
+  // all the upserts.
   const bulkOps: any[] = [];
 
   for (const r of registrants || []) {
@@ -204,10 +245,6 @@ export async function syncRegistrantsForWebinar(webinar: any, force = false): Pr
     const email = r.email.toLowerCase();
     currentEmails.add(email);
     const whatsapp_number = normalizeWhatsappNumber(r.whatsapp_number);
-
-    if (!alreadyTaggedEmails.has(email)) {
-      newlyRegistered.push({ email, first_name: r.first_name, whatsapp_number });
-    }
 
     bulkOps.push({
       updateOne: {
@@ -237,17 +274,17 @@ export async function syncRegistrantsForWebinar(webinar: any, force = false): Pr
     await EmailSubscriber.bulkWrite(bulkOps, { ordered: false });
   }
 
-  if (webinar.status === "upcoming") {
-    for (const r of newlyRegistered) {
-      if (!r.whatsapp_number) continue;
-      await sendLifecycleWhatsapp(
-        "webinar_registration_confirmation",
-        r.whatsapp_number,
-        { firstName: r.first_name || "there", webinarTitle: webinar.title, startsAt: webinar.starts_at, timezone: webinar.timezone },
-        r.email
-      );
-    }
-  }
+  // NOTE: registration-confirmation WhatsApp is deliberately NOT sent here.
+  // The main website already sends an instant confirmation
+  // (invitation_registration_confirmed, via POST /api/notifications/whatsapp/
+  // send) at the moment of registration. This sync used to ALSO message every
+  // registrant it hadn't tagged yet — which meant the first sync of a window
+  // (or any tag loss from the $pull reconciliation below, or two concurrent
+  // syncs racing) re-classified long-registered people as "new" and blasted
+  // "your seat is confirmed" again: clicking Sync Now could message the whole
+  // registrant list, and individuals received the same confirmation several
+  // times. Sync's job is tag reconciliation only; confirmation belongs to the
+  // registration moment.
 
   await EmailSubscriber.updateMany(
     { tags: tag, email: { $nin: Array.from(currentEmails) } },

@@ -8,10 +8,13 @@
 // DEFAULT_WHATSAPP_TEMPLATE_FOR_PRESET both point at each preset's real,
 // specific template rather than the "event_notify" generic — that one stays
 // in the type union and selectable as a manual fallback, but is no longer
-// anyone's default. webinar_registration_confirmation is also selectable
-// (added so it can be manually scheduled/re-sent, e.g. via Send Instantly)
-// even though its primary use is still the automatic send from
-// webinar-sync.ts on registration. webinar_cancelled/_rescheduled stay out
+// anyone's default. webinar_registration_confirmation is selectable for
+// manual scheduling/re-sending (e.g. via Send Instantly) only — it is NOT
+// sent automatically anymore: the sync-triggered send in webinar-sync.ts was
+// removed because it duplicated the main website's instant
+// invitation_registration_confirmed (sent at the moment of registration via
+// POST /api/notifications/whatsapp/send) and re-blasted the whole registrant
+// list whenever tagging state was reset. webinar_cancelled/_rescheduled stay out
 // of the dropdown — those are only ever sent automatically (from the cancel
 // route / a starts_at change) and firing one manually mid-flow would be
 // actively misleading (there's no cancellation/reschedule to report).
