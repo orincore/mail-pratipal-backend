@@ -13,18 +13,6 @@ interface WhatsappSendJobData {
   subscriberId: string;
 }
 
-// Same TRANSIENT_ERROR classification shape as send-throttle.ts's
-// isTransientSendError, adapted for MSG91's error shape (httpStatus attached
-// by msg91-whatsapp.provider.ts on throw).
-function isTransientWhatsappError(err: any): boolean {
-  if (!err) return false;
-  const status = err.httpStatus;
-  if (typeof status === "number" && (status === 429 || status >= 500)) return true;
-  const TRANSIENT_CODES = new Set(["ETIMEDOUT", "ECONNRESET", "ECONNREFUSED", "EPIPE", "EAI_AGAIN"]);
-  if (TRANSIENT_CODES.has(err.code)) return true;
-  return false;
-}
-
 async function processWhatsappSend(job: { data: WhatsappSendJobData }): Promise<void> {
   const { reminderId, subscriberId } = job.data;
 
@@ -42,24 +30,12 @@ async function processWhatsappSend(job: { data: WhatsappSendJobData }): Promise<
   const webinar = await Webinar.findById(reminder.webinar_id);
   if (!webinar || webinar.status === "cancelled") return;
 
-  // Hard guard, checked immediately before actually sending — not just at
-  // enqueue time (fan-out.ts's pendingSubscribersForLeg). A retried job, a
-  // re-triggered fan-out sweep, or a concurrent worker can all reach this
-  // point for a recipient who already has a recorded "sent" event; without
-  // this check they'd get the WhatsApp message a second time regardless of
-  // how the duplicate job arose.
-  const alreadySent = await EmailEvent.exists({
-    reminder_id: reminder._id,
-    recipient_email: subscriber.email.toLowerCase(),
-    channel: "whatsapp",
-    event_type: "sent",
-  });
-  if (alreadySent) return;
+  const recipient_email = subscriber.email.toLowerCase();
 
   if (!subscriber.whatsapp_number) {
     await EmailEvent.create({
       reminder_id: reminder._id,
-      recipient_email: subscriber.email.toLowerCase(),
+      recipient_email,
       channel: "whatsapp",
       event_type: "failed",
       timestamp: new Date(),
@@ -67,6 +43,28 @@ async function processWhatsappSend(job: { data: WhatsappSendJobData }): Promise<
     });
     await WebinarReminder.updateOne({ _id: reminder._id }, { $inc: { "stats.whatsapp_failed": 1 } });
     throw new UnrecoverableError("No WhatsApp number on file");
+  }
+
+  // Claim-FIRST: insert the unique-indexed "sent" row BEFORE calling MSG91.
+  // The old order (check exists → send → record) left a window where a
+  // re-triggered fan-out, a stalled-job re-run, or a concurrent worker could
+  // all pass the check and each deliver a real message — the unique index
+  // only caught the duplicate *record*, after the duplicate message had
+  // already gone out. With the claim first, exactly one process can ever own
+  // this (reminder, recipient) send; every other attempt hits a
+  // duplicate-key error here and skips without touching MSG91.
+  try {
+    await EmailEvent.create({
+      reminder_id: reminder._id,
+      recipient_email,
+      channel: "whatsapp",
+      event_type: "sent",
+      timestamp: new Date(),
+      details: { claimed: true },
+    });
+  } catch (claimErr: any) {
+    if (claimErr?.code === 11000) return; // already sent (or being sent) — never re-send
+    throw claimErr;
   }
 
   try {
@@ -90,29 +88,29 @@ async function processWhatsappSend(job: { data: WhatsappSendJobData }): Promise<
       buttonUrlSuffix,
     });
 
-    try {
-      await EmailEvent.create({
-        reminder_id: reminder._id,
-        recipient_email: subscriber.email.toLowerCase(),
-        channel: "whatsapp",
-        event_type: "sent",
-        timestamp: new Date(),
-        details: { messageId: result.messageId },
-      });
-      await WebinarReminder.updateOne({ _id: reminder._id }, { $inc: { "stats.whatsapp_sent": 1 } });
-    } catch (recordErr: any) {
-      // The message already went out above — a duplicate-key error here just
-      // means a concurrent attempt for this same recipient recorded "sent"
-      // first (the EmailEvent unique index catching a race the earlier
-      // alreadySent check missed by a hair). It is NOT a send failure, so
-      // don't fall into the catch below and log a bogus "failed" event on
-      // top of a message that was actually delivered.
-      if (recordErr?.code !== 11000) throw recordErr;
-    }
+    await EmailEvent.updateOne(
+      { reminder_id: reminder._id, recipient_email, channel: "whatsapp", event_type: "sent" },
+      { $set: { "details.messageId": result.messageId, "details.claimed": false } }
+    );
+    await WebinarReminder.updateOne({ _id: reminder._id }, { $inc: { "stats.whatsapp_sent": 1 } });
   } catch (err: any) {
+    // Release the claim so the failure is visible as "failed", not a phantom
+    // "sent" — but this job is NEVER retried (attempts: 1 in fan-out.ts):
+    // WhatsApp sends get exactly one attempt, because a "failure" here can be
+    // a response-side error (timeout/429/5xx) on a message MSG91 actually
+    // accepted and delivered, and retrying used to send recipients the same
+    // message up to 3 times. A manual Send Instantly re-fire is the recovery
+    // path for genuinely failed recipients.
+    await EmailEvent.deleteOne({
+      reminder_id: reminder._id,
+      recipient_email,
+      channel: "whatsapp",
+      event_type: "sent",
+      "details.claimed": true,
+    }).catch(() => {});
     await EmailEvent.create({
       reminder_id: reminder._id,
-      recipient_email: subscriber.email.toLowerCase(),
+      recipient_email,
       channel: "whatsapp",
       event_type: "failed",
       timestamp: new Date(),
@@ -120,10 +118,7 @@ async function processWhatsappSend(job: { data: WhatsappSendJobData }): Promise<
     });
     await WebinarReminder.updateOne({ _id: reminder._id }, { $inc: { "stats.whatsapp_failed": 1 } });
 
-    if (!isTransientWhatsappError(err)) {
-      throw new UnrecoverableError(err.message);
-    }
-    throw err;
+    throw new UnrecoverableError(err.message);
   }
 }
 
@@ -132,7 +127,4 @@ export const whatsappSendWorker = new Worker<WhatsappSendJobData>("whatsapp-send
   prefix: queuePrefix,
   concurrency: 5,
   limiter: { max: config.whatsapp.maxSendRatePerSecond, duration: 1000 },
-  settings: {
-    backoffStrategy: (attemptsMade: number) => Math.min(15000, 1000 * attemptsMade * attemptsMade),
-  },
 });

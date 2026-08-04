@@ -78,7 +78,15 @@ export async function fanOutReminderLeg(reminder: any, webinar: any, channel: Re
   }
 
   const queueName = channel === "email" ? "email-send" : "whatsapp-send";
-  const maxRetries = channel === "email" ? config.email.sendMaxRetries : config.whatsapp.sendMaxRetries;
+  // WhatsApp: exactly ONE attempt, never retried. WHATSAPP_SEND_MAX_RETRIES
+  // used to grant 3 attempts, and any "transient" failure (a timeout/429/5xx
+  // that MSG91 returned AFTER actually accepting the message) re-sent the
+  // whole message on each retry — recipients received the same reminder up to
+  // 3 times. A genuinely failed single attempt is recorded as "failed" and
+  // stays visible in stats; it is never silently re-fired. Email keeps its
+  // retries: a duplicate email is annoying, a failed one is invisible, and
+  // SES throttling (the usual transient failure) happens before acceptance.
+  const attempts = channel === "email" ? config.email.sendMaxRetries + 1 : 1;
 
   await flowProducer.add({
     name: "finalize",
@@ -97,8 +105,8 @@ export async function fanOutReminderLeg(reminder: any, webinar: any, channel: Re
       opts: {
         // BullMQ-level dedup — defense-in-depth alongside the EmailEvent check.
         jobId: `${channel}-${reminder._id}-${sub._id}`,
-        attempts: maxRetries + 1,
-        backoff: { type: "custom" },
+        attempts,
+        ...(channel === "email" ? { backoff: { type: "custom" as const } } : {}),
         removeOnComplete: { age: 24 * 3600, count: 5000 },
         removeOnFail: { age: 7 * 24 * 3600 },
       },
