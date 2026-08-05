@@ -2,6 +2,7 @@ import { Router, Request, Response } from "express";
 import { AuthenticatedRequest, authMiddleware, requireRole } from "../middleware/auth";
 import EmailSubscriber from "../models/EmailSubscriber";
 import { normalizeWhatsappNumber } from "../lib/phone";
+import { WHATSAPP_STOP_CONFIRMATION_TEXT, WHATSAPP_RESUME_CONFIRMATION_TEXT } from "../lib/whatsapp-templates";
 import { config } from "../config";
 import {
   createWhatsappTemplate,
@@ -47,11 +48,6 @@ function extractInboundText(body: any): string {
 // counterpart). Delivery-report events on the same webhook carry a
 // `direction` field that genuine inbound customer messages don't, so that's
 // used to ignore everything else.
-const STOP_CONFIRMATION_TEXT =
-  'We have suppressed all WhatsApp notifications for your number. To resume notifications, type "RESUME".';
-const RESUME_CONFIRMATION_TEXT =
-  'We have resumed the notification service. If you want to stop notifications, type "STOP" to stop receiving WhatsApp notifications.';
-
 router.post("/webhook", async (req: Request, res: Response) => {
   try {
     const secret = config.whatsapp.msg91.webhookSecret;
@@ -118,7 +114,7 @@ router.post("/webhook", async (req: Request, res: Response) => {
         await sendWhatsappSessionMessage({
           to: normalized,
           contentType: "text",
-          text: optingOut ? STOP_CONFIRMATION_TEXT : RESUME_CONFIRMATION_TEXT,
+          text: optingOut ? WHATSAPP_STOP_CONFIRMATION_TEXT : WHATSAPP_RESUME_CONFIRMATION_TEXT,
         }).catch((err) => console.error(`Failed to send ${optingOut ? "STOP" : "RESUME"} confirmation:`, err.message));
       }
     }

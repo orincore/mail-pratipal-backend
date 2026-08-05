@@ -171,3 +171,13 @@ export function buildWhatsappTemplateParams(
       return { bodyParams: [] };
   }
 }
+
+// Plain-text session-message bodies for the STOP/RESUME opt-out flow (see
+// routes/whatsapp.ts's POST /webhook and routes/subscribers.ts's
+// POST /whatsapp-suppressions/reactivate) — shared so the admin-triggered
+// reactivation sends the exact same confirmation wording as a customer
+// texting RESUME themselves, rather than two copies drifting apart.
+export const WHATSAPP_STOP_CONFIRMATION_TEXT =
+  'We have suppressed all WhatsApp notifications for your number. To resume notifications, type "RESUME".';
+export const WHATSAPP_RESUME_CONFIRMATION_TEXT =
+  'We have resumed the notification service. If you want to stop notifications, type "STOP" to stop receiving WhatsApp notifications.';

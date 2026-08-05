@@ -3,6 +3,8 @@ import { AuthenticatedRequest, authMiddleware } from "../middleware/auth";
 import EmailSubscriber from "../models/EmailSubscriber";
 import EmailEvent from "../models/EmailEvent";
 import mongoose from "mongoose";
+import { sendWhatsappSessionMessage } from "../providers/msg91-whatsapp-management.provider";
+import { WHATSAPP_RESUME_CONFIRMATION_TEXT } from "../lib/whatsapp-templates";
 
 const router = Router();
 
@@ -203,7 +205,30 @@ router.post("/whatsapp-suppressions/reactivate", async (req: AuthenticatedReques
     subscriber.whatsapp_opted_out_at = undefined;
     await subscriber.save();
 
-    return res.json({ success: true, subscriber });
+    // Same confirmation text a customer gets for texting RESUME themselves
+    // (see routes/whatsapp.ts's POST /webhook) — but unlike that flow, this
+    // is admin-triggered, so there's no guarantee the recipient messaged us
+    // recently enough for MSG91's 24h session window to still be open. A
+    // failure here must not fail the reactivation itself (the suppression
+    // flag is already cleared and that's the primary effect); it's reported
+    // back via `notified` so the admin UI can surface it instead.
+    let notified = false;
+    let notifyError: string | undefined;
+    if (subscriber.whatsapp_number) {
+      try {
+        await sendWhatsappSessionMessage({
+          to: subscriber.whatsapp_number,
+          contentType: "text",
+          text: WHATSAPP_RESUME_CONFIRMATION_TEXT,
+        });
+        notified = true;
+      } catch (err: any) {
+        notifyError = err.message;
+        console.error("Failed to send RESUME confirmation on manual reactivate:", err.message);
+      }
+    }
+
+    return res.json({ success: true, subscriber, notified, notifyError });
   } catch (error: any) {
     console.error("POST whatsapp-suppressions reactivate error:", error);
     return res.status(500).json({ error: error.message });
