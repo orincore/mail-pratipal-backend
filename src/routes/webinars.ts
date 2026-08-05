@@ -18,6 +18,7 @@ import {
   type WhatsappTemplateName,
 } from "../lib/whatsapp-templates";
 import { getMergedWhatsappTemplates } from "../lib/whatsapp-template-sync";
+import { normalizeWhatsappNumber } from "../lib/phone";
 import { config } from "../config";
 
 const router = Router();
@@ -77,7 +78,29 @@ router.get("/meta/whatsapp-templates", async (_req: AuthenticatedRequest, res: R
 // GET /api/webinars - list webinars with live registrant counts + reminders
 router.get("/", async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const webinars = await Webinar.find().sort({ starts_at: 1 }).lean();
+    // Auto-sync, replacing the old manual "Sync Now" button: both sync
+    // functions are internally throttled to once per 5 minutes (see
+    // webinar-sync.ts's SYNC_THROTTLE_MS) and were already written to be
+    // "safe to call on every sweep tick" — so calling them here unconditionally
+    // makes every page load double as that tick, with no separate cron needed.
+    // Fire-and-forget (not awaited): this list reads straight from MongoDB, so
+    // a slow upstream website fetch must never block the page — a sync that's
+    // still in flight just means this response is the pre-sync state, caught
+    // up by the next load.
+    syncWebinarsFromWebsite(false).catch((err) => console.error("Auto webinar sync failed:", err));
+
+    // syncRegistrantsForWebinar mutates and .save()s the doc it's given, so
+    // it needs real Mongoose documents — the .lean() query below (used for
+    // the actual response, for speed) would silently no-op it instead.
+    Webinar.find({ status: "upcoming" }).then((upcoming) => {
+      for (const w of upcoming) {
+        syncRegistrantsForWebinar(w, false).catch((err) =>
+          console.error("Auto registrant sync failed:", w.source_window_id, err)
+        );
+      }
+    });
+
+    const webinars = await Webinar.find().sort({ updated_at: -1 }).lean();
 
     const withDetails = await Promise.all(
       webinars.map(async (w: any) => {
@@ -205,6 +228,7 @@ router.put("/:id", async (req: AuthenticatedRequest, res: Response) => {
         const subscribers = await EmailSubscriber.find({
           tags: tag,
           whatsapp_number: { $exists: true, $ne: null },
+          whatsapp_opted_out: { $ne: true },
         }).lean();
         for (const sub of subscribers) {
           if (!sub.whatsapp_number) continue;
@@ -616,14 +640,28 @@ router.get("/:id/reminders/:reminderId/send-now-preview", async (req: Authentica
         status: "subscribed",
         tags: tag,
         whatsapp_number: { $exists: true, $ne: null },
-      }).select("email").lean();
+        whatsapp_opted_out: { $ne: true },
+      }).select("email whatsapp_number").lean();
       const sentTo = await EmailEvent.find({
         reminder_id: reminder._id,
         channel: "whatsapp",
         event_type: "sent",
       }).distinct("recipient_email");
       const sentSet = new Set(sentTo.map((e) => e.toLowerCase()));
-      whatsappPending = subscribers.filter((s) => s.email && !sentSet.has(s.email.toLowerCase())).length;
+      const pending = subscribers.filter((s) => s.email && !sentSet.has(s.email.toLowerCase()));
+
+      // Mirror fan-out.ts's phone dedup so this preview count matches what
+      // send-now will actually deliver — duplicate registrations under
+      // different emails but the same WhatsApp number collapse to one.
+      const seenPhones = new Set<string>();
+      for (const s of pending) {
+        const phone = normalizeWhatsappNumber((s as any).whatsapp_number);
+        if (phone) {
+          if (seenPhones.has(phone)) continue;
+          seenPhones.add(phone);
+        }
+        whatsappPending++;
+      }
     }
 
     return res.json({

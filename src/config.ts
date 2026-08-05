@@ -108,6 +108,16 @@ export const config = {
       integratedNumber: process.env.MSG91_WHATSAPP_INTEGRATED_NUMBER || "",
       namespace: process.env.MSG91_WHATSAPP_NAMESPACE || "",
       languageCode: process.env.MSG91_WHATSAPP_LANGUAGE_CODE || "en",
+      /**
+       * MSG91 doesn't sign/authenticate its webhook calls (no documented
+       * secret or signature header) — the only protection it offers is a
+       * custom header you set when creating the webhook in the MSG91
+       * dashboard (WhatsApp > Webhook (New) > Create Webhook > Custom
+       * Headers). Set the SAME value here and there; if left empty, the
+       * webhook route accepts unauthenticated requests (fine for local dev,
+       * not for a publicly reachable production URL).
+       */
+      webhookSecret: process.env.MSG91_WEBHOOK_SECRET || "",
     },
     /**
      * MSG91's actual per-second throughput for this account is unconfirmed —

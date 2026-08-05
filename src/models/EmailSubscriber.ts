@@ -6,6 +6,17 @@ export interface IEmailSubscriber extends Document {
   last_name?: string;
   whatsapp_number?: string;
   status: "subscribed" | "unsubscribed" | "bounced" | "complained" | "pending";
+  /**
+   * WhatsApp-specific opt-out — deliberately separate from `status`, which is
+   * an EMAIL deliverability/consent flag (see fan-out.ts's
+   * pendingSubscribersForLeg and queue-processor.ts's
+   * resolveAudienceSubscribers for the full rationale: reusing `status` for
+   * WhatsApp used to silently drop recipients over an unrelated email event).
+   * Set when this number replies "stop" to a WhatsApp message — see
+   * routes/whatsapp.ts's POST /webhook.
+   */
+  whatsapp_opted_out?: boolean;
+  whatsapp_opted_out_at?: Date;
   lists: string[]; // List IDs/Names
   tags: string[];
   metadata?: Record<string, any>;
@@ -20,6 +31,8 @@ const EmailSubscriberSchema = new Schema<IEmailSubscriber>(
     last_name: { type: String },
     whatsapp_number: { type: String },
     status: { type: String, enum: ["subscribed", "unsubscribed", "bounced", "complained", "pending"], default: "subscribed" },
+    whatsapp_opted_out: { type: Boolean, default: false, index: true },
+    whatsapp_opted_out_at: { type: Date },
     lists: [{ type: String, index: true }],
     tags: [{ type: String, index: true }],
     metadata: { type: Map, of: Schema.Types.Mixed },

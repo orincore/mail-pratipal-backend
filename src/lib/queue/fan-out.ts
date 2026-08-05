@@ -4,6 +4,7 @@ import EmailEvent from "../../models/EmailEvent";
 import { webinarTag } from "../webinar-sync";
 import { flowProducer } from "./queues";
 import { config } from "../../config";
+import { normalizeWhatsappNumber } from "../phone";
 
 export type ReminderChannel = "email" | "whatsapp";
 
@@ -18,6 +19,10 @@ export type ReminderChannel = "email" | "whatsapp";
 async function pendingSubscribersForLeg(reminderId: any, tag: string, channel: ReminderChannel) {
   const query: Record<string, any> = { tags: tag };
   if (channel === "email") query.status = "subscribed";
+  // WhatsApp's own opt-out signal (replied "STOP" — see routes/whatsapp.ts's
+  // POST /webhook), deliberately separate from the email `status` field per
+  // the comment above.
+  if (channel === "whatsapp") query.whatsapp_opted_out = { $ne: true };
   const subscribers = await EmailSubscriber.find(query);
   const sentTo = await EmailEvent.find({
     reminder_id: reminderId,
@@ -25,7 +30,31 @@ async function pendingSubscribersForLeg(reminderId: any, tag: string, channel: R
     event_type: "sent",
   }).distinct("recipient_email");
   const sentSet = new Set(sentTo.map((e: string) => e.toLowerCase()));
-  return subscribers.filter((sub: any) => sub.email && !sentSet.has(sub.email.toLowerCase()));
+  const pending = subscribers.filter((sub: any) => sub.email && !sentSet.has(sub.email.toLowerCase()));
+
+  if (channel !== "whatsapp") return pending;
+
+  // A re-registration under a different/typo'd email creates a SEPARATE
+  // EmailSubscriber doc (email is the only unique key on that model — see
+  // its schema), but carries the same whatsapp_number. Nothing upstream
+  // merges those, so without this the loop below would enqueue one real
+  // WhatsApp send per duplicate doc, all landing on the same phone. Email
+  // never hits this because the email-unique index already collapses
+  // same-email re-registrations to one doc before we even get here. Keep
+  // exactly one representative per normalized number.
+  const seenPhones = new Set<string>();
+  const deduped: typeof pending = [];
+  for (const sub of pending) {
+    const phone = normalizeWhatsappNumber(sub.whatsapp_number);
+    if (!phone) {
+      deduped.push(sub); // no number on file — let the worker record its existing "failed: no number" outcome
+      continue;
+    }
+    if (seenPhones.has(phone)) continue;
+    seenPhones.add(phone);
+    deduped.push(sub);
+  }
+  return deduped;
 }
 
 /**

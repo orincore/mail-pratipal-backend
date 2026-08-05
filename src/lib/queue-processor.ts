@@ -55,7 +55,10 @@ async function resolveAudienceSubscribers(
   audience: any,
   channel: "email" | "whatsapp"
 ): Promise<any[] | null> {
-  const baseQuery: any = channel === "email" ? { status: "subscribed" } : {};
+  // WhatsApp's own opt-out signal (replied "STOP" — see routes/whatsapp.ts's
+  // POST /webhook), kept separate from the email `status` field for the same
+  // reason `status` itself isn't reused here — see the comment above.
+  const baseQuery: any = channel === "email" ? { status: "subscribed" } : { whatsapp_opted_out: { $ne: true } };
 
   if (audience?.segment_id) {
     const segment = await Segment.findById(audience.segment_id);

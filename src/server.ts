@@ -24,6 +24,7 @@ import dashboardRouter from "./routes/dashboard";
 import webinarsRouter from "./routes/webinars";
 import segmentsRouter from "./routes/segments";
 import notificationsRouter from "./routes/notifications";
+import whatsappRouter from "./routes/whatsapp";
 import { queueAdminRouter, queueAdminBasePath } from "./routes/queue-admin";
 import { authMiddleware, requireRole } from "./middleware/auth";
 
@@ -86,6 +87,7 @@ app.use("/api/jobs", jobsRouter);
 app.use("/api/segments", segmentsRouter);
 app.use("/api/webinars", webinarsRouter);
 app.use("/api/notifications", notificationsRouter);
+app.use("/api/whatsapp", whatsappRouter);
 app.use(queueAdminBasePath, authMiddleware, requireRole("admin"), queueAdminRouter);
 app.use("/api", dashboardRouter);
 

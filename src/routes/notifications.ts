@@ -7,6 +7,7 @@ import {
   type TransactionalWhatsappEvent,
 } from "../lib/notification-templates";
 import { normalizeWhatsappNumber } from "../lib/phone";
+import EmailSubscriber from "../models/EmailSubscriber";
 
 const router = Router();
 
@@ -36,6 +37,17 @@ router.post("/whatsapp/send", async (req: AuthenticatedRequest, res: Response) =
   }
 
   try {
+    // Honor a past "STOP" reply even for transactional sends triggered
+    // directly by phone number from an external caller (this route doesn't
+    // otherwise look up an EmailSubscriber record at all) — WhatsApp
+    // business policy blocks ALL business-initiated messages once a
+    // recipient opts out, not just marketing ones, so this has to be
+    // checked here too, not only on the campaign/reminder paths.
+    const suppressed = await EmailSubscriber.exists({ whatsapp_number: toNumber, whatsapp_opted_out: true });
+    if (suppressed) {
+      return res.json({ success: false, error: "Recipient has opted out of WhatsApp messages" });
+    }
+
     const { bodyParams, buttonUrlSuffix } = buildTransactionalWhatsappParams(
       event as TransactionalWhatsappEvent,
       data || {}

@@ -188,6 +188,7 @@ export async function syncWebinarsFromWebsite(force = false): Promise<void> {
         const subscribers = await EmailSubscriber.find({
           tags: tag,
           whatsapp_number: { $exists: true, $ne: null },
+          whatsapp_opted_out: { $ne: true },
         }).lean();
         for (const sub of subscribers) {
           if (!sub.whatsapp_number) continue;
