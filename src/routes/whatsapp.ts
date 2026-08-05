@@ -42,10 +42,16 @@ function extractInboundText(body: any): string {
 // registering the webhook in the MSG91 dashboard, since MSG91 doesn't sign
 // or otherwise authenticate its webhook calls.
 //
-// Currently only handles the "reply STOP to opt out of WhatsApp" flow — the
-// WhatsApp equivalent of the email unsubscribe link. Delivery-report events
-// on the same webhook carry a `direction` field that genuine inbound
-// customer messages don't, so that's used to ignore everything else.
+// Handles "reply STOP to opt out" / "reply RESUME to opt back in" — the
+// WhatsApp equivalent of the email unsubscribe link (and its resubscribe
+// counterpart). Delivery-report events on the same webhook carry a
+// `direction` field that genuine inbound customer messages don't, so that's
+// used to ignore everything else.
+const STOP_CONFIRMATION_TEXT =
+  'We have suppressed all WhatsApp notifications for your number. To resume notifications, type "RESUME".';
+const RESUME_CONFIRMATION_TEXT =
+  'We have resumed the notification service. If you want to stop notifications, type "STOP" to stop receiving WhatsApp notifications.';
+
 router.post("/webhook", async (req: Request, res: Response) => {
   try {
     const secret = config.whatsapp.msg91.webhookSecret;
@@ -63,21 +69,37 @@ router.post("/webhook", async (req: Request, res: Response) => {
       return res.status(200).json({ ok: true, skipped: "not an inbound message" });
     }
 
-    const messageText = extractInboundText(body);
+    const messageText = extractInboundText(body).trim().toLowerCase();
     const rawNumber = String(body.customerNumber || "");
 
-    if (messageText.toLowerCase() === "stop" && rawNumber) {
+    if ((messageText === "stop" || messageText === "resume") && rawNumber) {
       const normalized = normalizeWhatsappNumber(rawNumber);
       if (normalized) {
+        const optingOut = messageText === "stop";
         // updateMany, not findOneAndUpdate: the same phone number can be on
         // several EmailSubscriber docs (duplicate registrations under
         // different emails — see fan-out.ts's phone dedup for the full
-        // story), and every one of them must stop receiving WhatsApp sends.
+        // story), and every one of them must be updated together.
         const result = await EmailSubscriber.updateMany(
           { whatsapp_number: normalized },
-          { $set: { whatsapp_opted_out: true, whatsapp_opted_out_at: new Date() } }
+          optingOut
+            ? { $set: { whatsapp_opted_out: true, whatsapp_opted_out_at: new Date() } }
+            : { $set: { whatsapp_opted_out: false }, $unset: { whatsapp_opted_out_at: "" } }
         );
-        console.log(`WhatsApp STOP from ${normalized} — opted out ${result.modifiedCount} subscriber record(s)`);
+        console.log(
+          `WhatsApp ${optingOut ? "STOP" : "RESUME"} from ${normalized} — updated ${result.modifiedCount} subscriber record(s)`
+        );
+
+        // Confirmation is sent as a session reply (not a template) — the
+        // customer just messaged us, so the 24h window is guaranteed open
+        // right now. A failure here must never fail the webhook itself
+        // (MSG91 would retry the whole inbound event), so it's caught and
+        // only logged.
+        await sendWhatsappSessionMessage({
+          to: normalized,
+          contentType: "text",
+          text: optingOut ? STOP_CONFIRMATION_TEXT : RESUME_CONFIRMATION_TEXT,
+        }).catch((err) => console.error(`Failed to send ${optingOut ? "STOP" : "RESUME"} confirmation:`, err.message));
       }
     }
 
