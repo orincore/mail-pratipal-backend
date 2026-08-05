@@ -156,6 +156,60 @@ router.post("/suppressions/reactivate", async (req: AuthenticatedRequest, res: R
   }
 });
 
+// GET /api/subscribers/whatsapp-suppressions - Recipients who replied "STOP" (see routes/whatsapp.ts's POST /webhook)
+router.get("/whatsapp-suppressions", async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page as string, 10) || 1);
+    const limit = Math.min(200, Math.max(1, parseInt(req.query.limit as string, 10) || 25));
+
+    const query = { whatsapp_opted_out: true };
+
+    const total = await EmailSubscriber.countDocuments(query);
+    const subscribers = await EmailSubscriber.find(query)
+      .sort({ whatsapp_opted_out_at: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .lean();
+
+    return res.json({
+      subscribers: subscribers.map((s: any) => ({ ...s, id: s._id.toString() })),
+      total,
+      page,
+      pages: Math.max(1, Math.ceil(total / limit)),
+    });
+  } catch (error: any) {
+    console.error("GET whatsapp-suppressions error:", error);
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/subscribers/whatsapp-suppressions/reactivate - Opt a recipient back into WhatsApp sends
+router.post("/whatsapp-suppressions/reactivate", async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { id } = req.body;
+    if (!id || !mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ error: "Subscriber ID is required" });
+    }
+
+    const subscriber = await EmailSubscriber.findById(id);
+    if (!subscriber) {
+      return res.status(404).json({ error: "Subscriber not found" });
+    }
+    if (!subscriber.whatsapp_opted_out) {
+      return res.status(400).json({ error: "Subscriber has not opted out of WhatsApp" });
+    }
+
+    subscriber.whatsapp_opted_out = false;
+    subscriber.whatsapp_opted_out_at = undefined;
+    await subscriber.save();
+
+    return res.json({ success: true, subscriber });
+  } catch (error: any) {
+    console.error("POST whatsapp-suppressions reactivate error:", error);
+    return res.status(500).json({ error: error.message });
+  }
+});
+
 // POST /api/subscribers - Create subscriber
 router.post("/", async (req: AuthenticatedRequest, res: Response) => {
   try {
