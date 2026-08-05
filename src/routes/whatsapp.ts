@@ -86,8 +86,28 @@ router.post("/webhook", async (req: Request, res: Response) => {
             ? { $set: { whatsapp_opted_out: true, whatsapp_opted_out_at: new Date() } }
             : { $set: { whatsapp_opted_out: false }, $unset: { whatsapp_opted_out_at: "" } }
         );
+
+        // STOP from a number with NO existing EmailSubscriber doc (never a
+        // campaign/webinar registrant) previously vanished silently —
+        // updateMany has nothing to match, so the opt-out was never
+        // persisted anywhere and never showed up in the suppression list,
+        // even though the confirmation reply still (correctly) went out.
+        // Create a standalone record purely to remember the opt-out, so a
+        // future registration under this number is caught by the same
+        // whatsapp_opted_out gate everywhere else in the app.
+        if (optingOut && result.matchedCount === 0) {
+          await EmailSubscriber.create({
+            whatsapp_number: normalized,
+            first_name: body.customerName || undefined,
+            whatsapp_opted_out: true,
+            whatsapp_opted_out_at: new Date(),
+          });
+        }
+
         console.log(
-          `WhatsApp ${optingOut ? "STOP" : "RESUME"} from ${normalized} — updated ${result.modifiedCount} subscriber record(s)`
+          `WhatsApp ${optingOut ? "STOP" : "RESUME"} from ${normalized} — updated ${result.modifiedCount} existing, created ${
+            optingOut && result.matchedCount === 0 ? 1 : 0
+          } new subscriber record(s)`
         );
 
         // Confirmation is sent as a session reply (not a template) — the
