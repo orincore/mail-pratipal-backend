@@ -15,6 +15,7 @@ import {
   DEFAULT_WHATSAPP_TEMPLATE_FOR_PRESET,
   buildWhatsappTemplateParams,
   describeOffset,
+  formatDate,
   type WhatsappTemplateName,
 } from "../lib/whatsapp-templates";
 import { getMergedWhatsappTemplates } from "../lib/whatsapp-template-sync";
@@ -531,6 +532,14 @@ router.post("/:id/reminders/:reminderId/test-send", async (req: AuthenticatedReq
       ]),
     } as any;
 
+    // Same {{date}} override as the real send path (email-send.worker.ts) —
+    // without it the tag falls back to prepareEmailHtml's default of
+    // "today", not the webinar's actual starts_at, so every test send shows
+    // the current date regardless of when the webinar is scheduled.
+    const tagOverrides: Record<string, string> = {
+      "{{date}}": formatDate(webinar.starts_at, webinar.timezone),
+    };
+
     const trackingUrl = config.appUrl;
     const parsedHtml = prepareEmailHtml({
       html: finalHtml,
@@ -538,9 +547,10 @@ router.post("/:id/reminders/:reminderId/test-send", async (req: AuthenticatedReq
       source: { type: "reminder", id: reminder._id.toString() },
       trackingUrl,
       trackingEnabled: { opens: false, clicks: false },
+      tagOverrides,
     });
 
-    const resolvedSubject = replaceMergeTags(`[TEST] ${reminder.subject}`, testSubscriber);
+    const resolvedSubject = replaceMergeTags(`[TEST] ${reminder.subject}`, testSubscriber, tagOverrides);
 
     const provider = getEmailProvider();
     const result = await provider.sendEmail({

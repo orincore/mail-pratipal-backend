@@ -105,7 +105,7 @@ export function describeOffset(offsetType: string, offsetValue?: number): string
   return "soon";
 }
 
-function formatDate(date: Date, timezone: string): string {
+export function formatDate(date: Date, timezone: string): string {
   return date.toLocaleDateString("en-IN", { timeZone: timezone, day: "numeric", month: "long", year: "numeric" });
 }
 

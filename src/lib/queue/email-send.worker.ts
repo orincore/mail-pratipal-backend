@@ -7,6 +7,7 @@ import Webinar from "../../models/Webinar";
 import { getEmailProvider } from "../../providers/provider-factory";
 import { prepareEmailHtml, replaceMergeTags, buildListUnsubscribeHeaders, TrackingSource } from "../tracking-parser";
 import { isTransientSendError, getDailyQuotaRemaining } from "../send-throttle";
+import { formatDate } from "../whatsapp-templates";
 import { wrapTextTemplate } from "../queue-processor";
 import { config } from "../../config";
 import { redisConnection, queuePrefix } from "./connection";
@@ -65,6 +66,7 @@ async function processEmailSend(job: { data: EmailSendJobData }): Promise<void> 
   const tagOverrides: Record<string, string> = {
     "{{join_link}}": `${config.mainWebsite.url}/webinar/join/${webinar.source_window_id}`,
     "{{webinar}}": webinar.title,
+    "{{date}}": formatDate(webinar.starts_at, webinar.timezone),
   };
 
   try {
