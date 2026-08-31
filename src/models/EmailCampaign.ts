@@ -14,6 +14,19 @@ export interface IEmailCampaign extends Document {
     tags: string[];
     all: boolean;
     segment_id?: mongoose.Types.ObjectId;
+    /**
+     * Webinar-based audience — an alternative to lists/tags/segment_id, not
+     * combinable with them (see resolveAudienceSubscribers in
+     * queue-processor.ts for resolution order). webinar_all takes every
+     * webinar's audience; webinar_ids selects specific ones. The registered_
+     * from/to date range only narrows anything when exactly one webinar_id
+     * is selected — across several it's ambiguous which occurrence a date
+     * refers to, so it's ignored.
+     */
+    webinar_ids?: mongoose.Types.ObjectId[];
+    webinar_all?: boolean;
+    webinar_registered_from?: Date;
+    webinar_registered_to?: Date;
   };
   /**
    * A/B subject/template test. When enabled, each recipient is
@@ -69,6 +82,10 @@ const EmailCampaignSchema = new Schema<IEmailCampaign>(
       tags: [{ type: String }],
       all: { type: Boolean, default: false },
       segment_id: { type: Schema.Types.ObjectId, ref: "Segment" },
+      webinar_ids: [{ type: Schema.Types.ObjectId, ref: "Webinar" }],
+      webinar_all: { type: Boolean, default: false },
+      webinar_registered_from: { type: Date },
+      webinar_registered_to: { type: Date },
     },
     ab_test: {
       enabled: { type: Boolean, default: false },

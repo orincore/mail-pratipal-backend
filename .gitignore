@@ -14,3 +14,13 @@ npm-debug.log*
 
 # system files
 .DS_Store
+
+# build output & caches
+/build/
+.turbo/
+*.tsbuildinfo  # incremental TypeScript build info
+/coverage/
+
+# process logs
+nohup.out
+*.log

@@ -9,6 +9,16 @@ export interface IWebinar extends Document {
   source_window_id: string;
   slug: string;
   title: string;
+  /**
+   * The registration window's own name (e.g. "July 2026 Batch") — distinct
+   * from `title`, which is the landing page's title and is IDENTICAL across
+   * every window belonging to the same page. Without this, a page with
+   * several occurrences is impossible to tell apart anywhere this list is
+   * rendered — same title, repeated once per window. Undefined for the
+   * synthetic "page:<slug>" webinar a page with no window gets (see
+   * webinar-sync.ts) — there's nothing to disambiguate it from.
+   */
+  window_name?: string;
   starts_at: Date;
   timezone: string;
   status: "upcoming" | "completed" | "cancelled";
@@ -31,6 +41,7 @@ const WebinarSchema = new Schema<IWebinar>(
     source_window_id: { type: String, required: true, unique: true },
     slug: { type: String, required: true, index: true },
     title: { type: String, required: true },
+    window_name: { type: String },
     starts_at: { type: Date, required: true, index: true },
     timezone: { type: String, default: () => config.branding.timezone },
     status: {

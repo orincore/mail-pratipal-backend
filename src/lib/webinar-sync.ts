@@ -136,6 +136,7 @@ export async function syncWebinarsFromWebsite(force = false): Promise<void> {
         $set: {
           slug: w.slug,
           title: w.title,
+          window_name: w.window_name || undefined,
           starts_at: newStartsAt,
           timezone: w.webinar_timezone || config.branding.timezone,
           registration_start: w.registration_start ? new Date(w.registration_start) : undefined,
@@ -247,6 +248,16 @@ export async function syncRegistrantsForWebinar(webinar: any, force = false): Pr
     currentEmails.add(email);
     const whatsapp_number = normalizeWhatsappNumber(r.whatsapp_number);
 
+    // registered_at:<tag> — this registrant's created_at on the MAIN
+    // WEBSITE for THIS specific webinar occurrence, keyed by the same tag
+    // that marks them as its audience. Plain "created_at" on EmailSubscriber
+    // is this record's own first-ever sync (or a prior, unrelated webinar's,
+    // for anyone who's registered more than once) — no good for "audience of
+    // this webinar between these dates." $set, not $setOnInsert: an existing
+    // subscriber re-registering for the same occurrence (rare, but possible
+    // after a cancelled + re-opened window) should pick up the latest date.
+    const registeredAt = r.created_at ? new Date(r.created_at) : null;
+
     bulkOps.push({
       updateOne: {
         filter: { email },
@@ -263,6 +274,9 @@ export async function syncRegistrantsForWebinar(webinar: any, force = false): Pr
             // resolves InvitationWindow.findById(), not this backend's Webinar._id.
             "metadata.webinar_join_link": `${config.mainWebsite.url}/webinar/join/${webinar.source_window_id}`,
             ...(whatsapp_number ? { whatsapp_number } : {}),
+            ...(registeredAt && !Number.isNaN(registeredAt.getTime())
+              ? { [`metadata.registered_at:${tag}`]: registeredAt }
+              : {}),
           },
           $addToSet: { tags: tag },
         },

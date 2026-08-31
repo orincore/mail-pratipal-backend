@@ -14,6 +14,8 @@ const VALID_RULE_FIELDS = [
   "status",
   "list",
   "tag",
+  "webinar",
+  "windowed",
   "opened_last_days",
   "clicked_last_days",
   "not_opened_last_days",

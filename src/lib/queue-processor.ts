@@ -3,6 +3,7 @@ import EmailCampaign from "../models/EmailCampaign";
 import EmailTemplate from "../models/EmailTemplate";
 import EmailEvent from "../models/EmailEvent";
 import Segment from "../models/Segment";
+import Webinar from "../models/Webinar";
 import { getEmailProvider } from "../providers/provider-factory";
 import {
   prepareEmailHtml,
@@ -12,6 +13,7 @@ import {
 } from "./tracking-parser";
 import { buildSubscriberQueryForSegment } from "./segment-query";
 import { sendEmailThrottled, getDailyQuotaRemaining, isTransientSendError } from "./send-throttle";
+import { webinarTag } from "./webinar-sync";
 import { config } from "../config";
 import { sendWhatsappTemplate } from "../providers/msg91-whatsapp.provider";
 import { buildWhatsappTemplateParams, type WhatsappTemplateName } from "./whatsapp-templates";
@@ -59,6 +61,34 @@ async function resolveAudienceSubscribers(
   // POST /webhook), kept separate from the email `status` field for the same
   // reason `status` itself isn't reused here — see the comment above.
   const baseQuery: any = channel === "email" ? { status: "subscribed" } : { whatsapp_opted_out: { $ne: true } };
+
+  // Webinar audience — one/several specific occurrences, or every webinar's
+  // registrants at once. Resolved from the tags syncRegistrantsForWebinar
+  // (webinar-sync.ts) already maintains, so this needs nothing new tracked
+  // per-subscriber beyond what registrant sync was already doing.
+  if (audience?.webinar_all || audience?.webinar_ids?.length > 0) {
+    const webinarQuery = audience.webinar_all ? {} : { _id: { $in: audience.webinar_ids } };
+    const webinars = await Webinar.find(webinarQuery).select("source_window_id");
+    if (webinars.length === 0) return null;
+    const tags = webinars.map((w: any) => webinarTag(w));
+
+    // "Registered between" only makes sense pinned to exactly one webinar —
+    // across several occurrences a single date range is ambiguous, so it's
+    // silently ignored rather than guessing which webinar it was meant for
+    // (the wizard UI itself only ever offers the date fields for one).
+    if (tags.length === 1 && (audience.webinar_registered_from || audience.webinar_registered_to)) {
+      const dateQuery: any = {};
+      if (audience.webinar_registered_from) dateQuery.$gte = new Date(audience.webinar_registered_from);
+      if (audience.webinar_registered_to) dateQuery.$lte = new Date(audience.webinar_registered_to);
+      return EmailSubscriber.find({
+        ...baseQuery,
+        tags: tags[0],
+        [`metadata.registered_at:${tags[0]}`]: dateQuery,
+      });
+    }
+
+    return EmailSubscriber.find({ ...baseQuery, tags: { $in: tags } });
+  }
 
   if (audience?.segment_id) {
     const segment = await Segment.findById(audience.segment_id);

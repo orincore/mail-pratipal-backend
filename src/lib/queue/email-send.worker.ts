@@ -1,4 +1,4 @@
-import { Worker, UnrecoverableError } from "bullmq";
+import { Worker, UnrecoverableError, Job } from "bullmq";
 import EmailSubscriber from "../../models/EmailSubscriber";
 import EmailTemplate from "../../models/EmailTemplate";
 import EmailEvent from "../../models/EmailEvent";
@@ -6,7 +6,7 @@ import WebinarReminder from "../../models/WebinarReminder";
 import Webinar from "../../models/Webinar";
 import { getEmailProvider } from "../../providers/provider-factory";
 import { prepareEmailHtml, replaceMergeTags, buildListUnsubscribeHeaders, TrackingSource } from "../tracking-parser";
-import { isTransientSendError, getDailyQuotaRemaining } from "../send-throttle";
+import { isTransientSendError, getDailyQuotaRemaining, sendEmailThrottled } from "../send-throttle";
 import { formatDate } from "../whatsapp-templates";
 import { wrapTextTemplate } from "../queue-processor";
 import { config } from "../../config";
@@ -21,7 +21,7 @@ interface EmailSendJobData {
 // Re-fetches everything fresh at send time (not baked in at enqueue) so a job
 // sitting behind the rate limiter for a while never sends stale content to a
 // subscriber who e.g. unsubscribed in the meantime.
-async function processEmailSend(job: { data: EmailSendJobData }): Promise<void> {
+async function processEmailSend(job: Job<EmailSendJobData>): Promise<void> {
   const { reminderId, subscriberId } = job.data;
 
   const [reminder, subscriber] = await Promise.all([
@@ -81,7 +81,13 @@ async function processEmailSend(job: { data: EmailSendJobData }): Promise<void> 
     const finalHtml = wrapTextTemplate(customizedHtml, template.type);
 
     const provider = getEmailProvider();
-    const { messageId } = await provider.sendEmail({
+    // Shared with the campaign send path (queue-processor.ts) — one process-
+    // wide pacer, so a reminder sweep and a campaign sweep running at the
+    // same moment split the SAME per-second SES budget instead of each
+    // independently believing it owns the full rate and together blowing
+    // past it. Also retries transient errors (SES throttling included) with
+    // backoff internally, before this ever reaches the catch block below.
+    const { messageId } = await sendEmailThrottled(provider, {
       to: subscriber.email,
       fromName: reminder.sender_name,
       fromEmail: reminder.sender_email,
@@ -107,17 +113,33 @@ async function processEmailSend(job: { data: EmailSendJobData }): Promise<void> 
       if (recordErr?.code !== 11000) throw recordErr;
     }
   } catch (err: any) {
-    await EmailEvent.create({
-      reminder_id: reminder._id,
-      recipient_email: subscriber.email.toLowerCase(),
-      channel: "email",
-      event_type: "failed",
-      timestamp: new Date(),
-      details: { error: err.message, transient: isTransientSendError(err) },
-    });
-    await WebinarReminder.updateOne({ _id: reminder._id }, { $inc: { "stats.failed": 1 } });
+    const transient = isTransientSendError(err);
+    // sendEmailThrottled already retried transient errors (SES throttling
+    // included) internally before ever throwing here, but BullMQ still has
+    // its OWN retry budget on top (job.opts.attempts, set in fan-out.ts) —
+    // this job isn't done for good until that's exhausted too. Recording a
+    // "failed" EmailEvent on attempt 1 of N for something that goes on to
+    // succeed on attempt 2 doubled-up as both "failed" and "sent" on the
+    // dashboard, showing recipients as delivery failures when their email
+    // actually went out a few seconds later — the exact false alarm this
+    // guards against. Only log it once nothing more will be tried.
+    const attemptsMade = job.attemptsMade ?? 1;
+    const maxAttempts = job.opts?.attempts ?? 1;
+    const isFinalAttempt = !transient || attemptsMade >= maxAttempts;
 
-    if (!isTransientSendError(err)) {
+    if (isFinalAttempt) {
+      await EmailEvent.create({
+        reminder_id: reminder._id,
+        recipient_email: subscriber.email.toLowerCase(),
+        channel: "email",
+        event_type: "failed",
+        timestamp: new Date(),
+        details: { error: err.message, transient },
+      });
+      await WebinarReminder.updateOne({ _id: reminder._id }, { $inc: { "stats.failed": 1 } });
+    }
+
+    if (!transient) {
       // Permanent failure (bad address, rejected identity) — don't burn retries.
       throw new UnrecoverableError(err.message);
     }

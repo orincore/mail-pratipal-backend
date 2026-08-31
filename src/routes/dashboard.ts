@@ -7,6 +7,7 @@ import EmailTemplate from "../models/EmailTemplate";
 import WebinarReminder from "../models/WebinarReminder";
 import Webinar from "../models/Webinar";
 import { config } from "../config";
+import { getWhatsappAnalytics } from "../providers/msg91-whatsapp-management.provider";
 
 const router = Router();
 
@@ -40,9 +41,47 @@ router.get("/dashboard-stats", async (req: AuthenticatedRequest, res: Response) 
   try {
     const timeframe = (req.query.timeframe as string) || "weekly";
 
+    // A custom range is the only one with a real upper bound — the presets
+    // all mean "since X, through right now." Parsed as local calendar dates
+    // (not `new Date("YYYY-MM-DD")`, which lands on UTC midnight) so "Jan 5"
+    // means the same day here as it did in the date picker.
+    const parseLocalDate = (s?: string): Date | null => {
+      const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s || "");
+      if (!m) return null;
+      const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+      return Number.isNaN(d.getTime()) ? null : d;
+    };
+    // Per-day stats below cost 4 count queries each; an unbounded custom
+    // range (someone fat-fingering a decade) would turn into thousands of
+    // round trips. Three months is generous for "what happened between these
+    // two dates" without opening that door.
+    const MAX_CUSTOM_RANGE_DAYS = 90;
+
     // 1. Determine date filter boundaries
     let startOfPeriod = new Date();
-    if (timeframe === "daily") {
+    let endOfPeriod: Date | null = null; // non-null only for a bounded custom range
+    if (timeframe === "custom") {
+      const parsedFrom = parseLocalDate(req.query.from as string);
+      const parsedTo = parseLocalDate(req.query.to as string);
+      if (parsedFrom && parsedTo) {
+        // Accept either order — swap if the two dates arrived backwards.
+        startOfPeriod = parsedFrom <= parsedTo ? parsedFrom : parsedTo;
+        endOfPeriod = parsedFrom <= parsedTo ? parsedTo : parsedFrom;
+        startOfPeriod.setHours(0, 0, 0, 0);
+        endOfPeriod.setHours(23, 59, 59, 999);
+        const spanDays = Math.floor((endOfPeriod.getTime() - startOfPeriod.getTime()) / 86400000);
+        if (spanDays > MAX_CUSTOM_RANGE_DAYS) {
+          startOfPeriod = new Date(endOfPeriod);
+          startOfPeriod.setDate(startOfPeriod.getDate() - MAX_CUSTOM_RANGE_DAYS);
+          startOfPeriod.setHours(0, 0, 0, 0);
+        }
+      } else {
+        // Malformed/missing dates — fall back to the weekly default rather
+        // than erroring the whole dashboard out.
+        startOfPeriod.setDate(startOfPeriod.getDate() - 6);
+        startOfPeriod.setHours(0, 0, 0, 0);
+      }
+    } else if (timeframe === "daily") {
       startOfPeriod.setHours(0, 0, 0, 0);
     } else if (timeframe === "monthly") {
       startOfPeriod.setDate(startOfPeriod.getDate() - 29);
@@ -52,7 +91,9 @@ router.get("/dashboard-stats", async (req: AuthenticatedRequest, res: Response) 
       startOfPeriod.setHours(0, 0, 0, 0);
     }
 
-    const eventQuery = { timestamp: { $gte: startOfPeriod } };
+    const eventQuery = endOfPeriod
+      ? { timestamp: { $gte: startOfPeriod, $lte: endOfPeriod } }
+      : { timestamp: { $gte: startOfPeriod } };
 
     // 2. Fetch metrics from MongoDB within timeframe
     const totalSubscribers = await EmailSubscriber.countDocuments({ status: "subscribed" });
@@ -68,7 +109,24 @@ router.get("/dashboard-stats", async (req: AuthenticatedRequest, res: Response) 
     // WhatsApp specific metrics ("bounce" kept for rows recorded before the failed/bounce split)
     const totalWhatsappSent = await EmailEvent.countDocuments({ event_type: "sent", channel: "whatsapp", ...eventQuery });
     const totalWhatsappFailed = await EmailEvent.countDocuments({ event_type: { $in: ["bounce", "failed"] }, channel: "whatsapp", ...eventQuery });
-    const totalWhatsappOpens = await EmailEvent.countDocuments({ event_type: "open", channel: "whatsapp", ...eventQuery });
+
+    // "Opened" has no equivalent EmailEvent row to count: the inbound
+    // webhook (routes/whatsapp.ts POST /webhook) only handles STOP/RESUME
+    // replies and explicitly discards every delivery-report/read-receipt
+    // callback MSG91 sends, so an "open" event for WhatsApp is never
+    // recorded anywhere — this always read 0.0% before. MSG91's own
+    // analytics endpoint (the same one the WhatsApp Analytics tab uses)
+    // reports a "read" count for the period instead, so ask it directly
+    // rather than a DB query. It's a real network call to a third party —
+    // one failure here must never break the rest of the dashboard.
+    const toDateStr = (d: Date) => d.toISOString().slice(0, 10);
+    let totalWhatsappOpens = 0;
+    try {
+      const analytics = await getWhatsappAnalytics(toDateStr(startOfPeriod), toDateStr(endOfPeriod || new Date()));
+      totalWhatsappOpens = Number(analytics?.total?.read) || 0;
+    } catch (err: any) {
+      console.error("dashboard-stats: MSG91 analytics fetch failed, defaulting WhatsApp opens to 0:", err.message);
+    }
 
     // Rolling 24h SES quota usage for the header gauge
     const quotaSince = new Date(Date.now() - 24 * 60 * 60 * 1000);
@@ -89,7 +147,50 @@ router.get("/dashboard-stats", async (req: AuthenticatedRequest, res: Response) 
     // 4. Generate performance timeline stats based on timeframe
     const dailyStats: any[] = [];
 
-    if (timeframe === "daily") {
+    if (timeframe === "custom" && endOfPeriod) {
+      // One point per calendar day across whatever range was picked —
+      // already clamped to MAX_CUSTOM_RANGE_DAYS above.
+      const totalDays = Math.floor((endOfPeriod.getTime() - startOfPeriod.getTime()) / 86400000) + 1;
+      for (let i = 0; i < totalDays; i++) {
+        const day = new Date(startOfPeriod);
+        day.setDate(day.getDate() + i);
+
+        const startOfDay = new Date(day.setHours(0, 0, 0, 0));
+        const endOfDay = new Date(day.setHours(23, 59, 59, 999));
+
+        const sent = await EmailEvent.countDocuments({
+          event_type: "sent",
+          channel: { $ne: "whatsapp" },
+          timestamp: { $gte: startOfDay, $lte: endOfDay },
+        });
+
+        const opens = await EmailEvent.countDocuments({
+          event_type: "open",
+          timestamp: { $gte: startOfDay, $lte: endOfDay },
+        });
+
+        const whatsappSent = await EmailEvent.countDocuments({
+          event_type: "sent",
+          channel: "whatsapp",
+          timestamp: { $gte: startOfDay, $lte: endOfDay },
+        });
+
+        const whatsappFailed = await EmailEvent.countDocuments({
+          event_type: { $in: ["bounce", "failed"] },
+          channel: "whatsapp",
+          timestamp: { $gte: startOfDay, $lte: endOfDay },
+        });
+
+        chartStatsPush(
+          dailyStats,
+          day.toLocaleDateString("en-IN", { month: "short", day: "numeric" }),
+          sent,
+          opens,
+          whatsappSent,
+          whatsappFailed
+        );
+      }
+    } else if (timeframe === "daily") {
       // 24 hours of today
       for (let i = 0; i < 24; i++) {
         const startOfHour = new Date(startOfPeriod);

@@ -2,9 +2,11 @@ import { Router, Response } from "express";
 import { AuthenticatedRequest, authMiddleware } from "../middleware/auth";
 import EmailSubscriber from "../models/EmailSubscriber";
 import EmailEvent from "../models/EmailEvent";
+import Webinar from "../models/Webinar";
 import mongoose from "mongoose";
 import { sendWhatsappSessionMessage } from "../providers/msg91-whatsapp-management.provider";
 import { WHATSAPP_RESUME_CONFIRMATION_TEXT } from "../lib/whatsapp-templates";
+import { webinarTag } from "../lib/webinar-sync";
 
 const router = Router();
 
@@ -55,6 +57,20 @@ router.get("/", async (req: AuthenticatedRequest, res: Response) => {
     const allLists = await EmailSubscriber.distinct("lists");
     const allTags = await EmailSubscriber.distinct("tags");
 
+    // Auto-generated webinar registrant tags (see webinarTag in
+    // webinar-sync.ts) are an opaque id to a human —
+    // "webinar-window:6a92ac2c04c72d6410208e63" means nothing without
+    // looking the webinar up. Resolve every one to its actual title here,
+    // once, so every screen that renders a tag (subscriber chips, the
+    // campaign wizard's tag filter, …) can show something readable without
+    // each having to know how a webinar tag is built. Tags with no entry
+    // here are ordinary manual tags — the frontend just shows those as-is.
+    const webinars = await Webinar.find().select("source_window_id title");
+    const tagLabels: Record<string, string> = {};
+    for (const w of webinars) {
+      tagLabels[webinarTag(w)] = (w as any).title;
+    }
+
     return res.json({
       subscribers,
       total,
@@ -62,6 +78,7 @@ router.get("/", async (req: AuthenticatedRequest, res: Response) => {
       pages: Math.max(1, Math.ceil(total / limit)),
       lists: allLists.filter(Boolean),
       tags: allTags.filter(Boolean),
+      tagLabels,
     });
   } catch (error: any) {
     console.error("GET subscribers error:", error);
@@ -464,7 +481,15 @@ router.get("/:id", async (req: AuthenticatedRequest, res: Response) => {
       return res.status(404).json({ error: "Subscriber not found" });
     }
 
-    return res.json({ subscriber });
+    // See GET / above for why — this subscriber's own tags can include
+    // auto-generated webinar ones that need the same id → title resolution.
+    const webinars = await Webinar.find().select("source_window_id title");
+    const tagLabels: Record<string, string> = {};
+    for (const w of webinars) {
+      tagLabels[webinarTag(w)] = (w as any).title;
+    }
+
+    return res.json({ subscriber, tagLabels });
   } catch (error: any) {
     console.error("GET subscriber error:", error);
     return res.status(500).json({ error: error.message });

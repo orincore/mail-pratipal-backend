@@ -4,6 +4,8 @@ export type SegmentRuleField =
   | "status"
   | "list"
   | "tag"
+  | "webinar"
+  | "windowed"
   | "opened_last_days"
   | "clicked_last_days"
   | "not_opened_last_days"
@@ -13,9 +15,17 @@ export type SegmentRuleOperator = "is" | "is_not";
 
 export interface ISegmentRule {
   field: SegmentRuleField;
-  /** Only meaningful for status/list/tag rules; engagement/recency rules always use "is". */
+  /**
+   * Only meaningful for status/list/tag/webinar/windowed rules — engagement/
+   * recency rules always use "is". For "windowed", is/is_not means "inside
+   * some registration window" / "not inside any" (across all landing pages).
+   */
   operator: SegmentRuleOperator;
-  /** Status name, list name, tag name — or number of days for the *_last_days fields. */
+  /**
+   * Status name, list name, tag name, a Webinar._id (or ANY_WEBINAR_VALUE
+   * from segment-query.ts, for "webinar") — or number of days for the
+   * *_last_days fields. Unused but still required for "windowed".
+   */
   value: string;
 }
 
@@ -37,6 +47,8 @@ const SegmentRuleSchema = new Schema<ISegmentRule>(
         "status",
         "list",
         "tag",
+        "webinar",
+        "windowed",
         "opened_last_days",
         "clicked_last_days",
         "not_opened_last_days",

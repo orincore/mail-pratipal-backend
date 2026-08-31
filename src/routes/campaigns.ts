@@ -6,6 +6,7 @@ import EmailEvent from "../models/EmailEvent";
 import { getEmailProvider } from "../providers/provider-factory";
 import "../models/EmailTemplate"; // Ensure template model is registered for populate
 import "../models/Segment"; // Ensure segment model is registered for populate
+import "../models/Webinar"; // Ensure webinar model is registered for populate
 import { prepareEmailHtml, replaceMergeTags } from "../lib/tracking-parser";
 import { sendWhatsappTemplate } from "../providers/msg91-whatsapp.provider";
 import { getMergedWhatsappTemplates } from "../lib/whatsapp-template-sync";
@@ -46,6 +47,14 @@ function sanitizeAbTest(abTest: any) {
 }
 
 function sanitizeAudience(audience: any) {
+  const webinar_ids = Array.isArray(audience?.webinar_ids)
+    ? audience.webinar_ids.filter((id: any) => mongoose.isValidObjectId(id))
+    : [];
+  const parseDate = (v: any) => {
+    if (!v) return undefined;
+    const d = new Date(v);
+    return Number.isNaN(d.getTime()) ? undefined : d;
+  };
   return {
     all: !!audience?.all,
     lists: Array.isArray(audience?.lists) ? audience.lists : [],
@@ -54,6 +63,13 @@ function sanitizeAudience(audience: any) {
       audience?.segment_id && mongoose.isValidObjectId(audience.segment_id)
         ? audience.segment_id
         : undefined,
+    webinar_ids,
+    webinar_all: !!audience?.webinar_all,
+    // Only meaningful pinned to exactly one webinar — see the schema comment
+    // in models/EmailCampaign.ts — but harmless to store regardless; the
+    // resolver is what actually ignores it otherwise.
+    webinar_registered_from: parseDate(audience?.webinar_registered_from),
+    webinar_registered_to: parseDate(audience?.webinar_registered_to),
   };
 }
 
@@ -81,7 +97,8 @@ router.get("/", async (req: AuthenticatedRequest, res: Response) => {
       .limit(limit)
       .populate("template_id", "name")
       .populate("ab_test.template_id_b", "name")
-      .populate("audience.segment_id", "name");
+      .populate("audience.segment_id", "name")
+      .populate("audience.webinar_ids", "title window_name");
 
     return res.json({
       campaigns,
@@ -321,7 +338,8 @@ router.get("/:id/analytics", async (req: AuthenticatedRequest, res: Response) =>
     const campaign = await EmailCampaign.findById(id)
       .populate("template_id", "name")
       .populate("ab_test.template_id_b", "name")
-      .populate("audience.segment_id", "name");
+      .populate("audience.segment_id", "name")
+      .populate("audience.webinar_ids", "title window_name");
     if (!campaign) {
       return res.status(404).json({ error: "Campaign not found" });
     }

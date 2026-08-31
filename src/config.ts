@@ -41,8 +41,15 @@ export const config = {
    * embedded in outgoing emails. NOT the NEXT_PUBLIC_APP_URL frontend env
    * var (that's a separate app's build-time value the backend can't see) —
    * set APP_URL explicitly in the backend's own .env.
+   *
+   * A quietly-wrong value here doesn't fail loudly — it bakes itself into
+   * every tracking pixel/unsubscribe link in whatever email goes out next,
+   * and already-delivered mail can't be patched after the fact. That's what
+   * made "why is the open rate always 0%" hard to trace back to a missing
+   * env var. requiredSecret() means a missing APP_URL now fails startup in
+   * production instead of silently shipping links to localhost.
    */
-  appUrl: process.env.APP_URL || "http://localhost:3001",
+  appUrl: requiredSecret("APP_URL", "http://localhost:3002"),
   mainWebsite: {
     url: process.env.MAIN_WEBSITE_URL || "http://localhost:3000",
     apiKey: process.env.MAIN_WEBSITE_API_KEY || "",
