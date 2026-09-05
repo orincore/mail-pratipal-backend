@@ -146,6 +146,7 @@ router.post("/", async (req: AuthenticatedRequest, res: Response) => {
       whatsapp_template,
       whatsapp_title,
       whatsapp_variables,
+      whatsapp_preview_body,
       ab_test,
       save_as_draft,
     } = req.body;
@@ -204,6 +205,7 @@ router.post("/", async (req: AuthenticatedRequest, res: Response) => {
       whatsapp_template: resolvedChannel !== "email" ? resolvedWhatsappTemplate : undefined,
       whatsapp_title: resolvedChannel !== "email" && whatsapp_title ? whatsapp_title : undefined,
       whatsapp_variables: resolvedChannel !== "email" ? sanitizedWhatsappVariables : undefined,
+      whatsapp_preview_body: resolvedChannel !== "email" && whatsapp_preview_body ? String(whatsapp_preview_body).slice(0, 2000) : undefined,
       ab_test: resolvedChannel !== "whatsapp" ? sanitizedAb : undefined,
       audience: sanitizeAudience(audience),
       schedule_type: schedule_type || "immediate",
@@ -314,6 +316,7 @@ router.put("/", async (req: AuthenticatedRequest, res: Response) => {
       "channel",
       "whatsapp_template",
       "whatsapp_title",
+      "whatsapp_preview_body",
       "schedule_type",
       "scheduled_at",
     ];
@@ -614,6 +617,7 @@ router.post("/:id/rerun", async (req: AuthenticatedRequest, res: Response) => {
       whatsapp_template: campaign.whatsapp_template,
       whatsapp_title: campaign.whatsapp_title,
       whatsapp_variables: campaign.whatsapp_variables,
+      whatsapp_preview_body: campaign.whatsapp_preview_body,
       ab_test: campaign.ab_test,
       audience: campaign.audience,
       schedule_type,
@@ -653,7 +657,17 @@ router.post("/:id/test-send-whatsapp", async (req: AuthenticatedRequest, res: Re
     let bodyParams: string[];
     let buttonUrlSuffix: string | undefined;
     if (campaign.whatsapp_variables?.length) {
-      bodyParams = campaign.whatsapp_variables;
+      // Merge tags (e.g. {{first_name}}) an admin typed into a custom
+      // template's variables need something to resolve against — there's no
+      // real subscriber for a test send, so a synthetic one stands in.
+      const testSubscriber = {
+        first_name: "Test",
+        last_name: "Recipient",
+        email: "test@example.com",
+        whatsapp_number: to,
+        metadata: new Map(),
+      } as any;
+      bodyParams = campaign.whatsapp_variables.map((v: string) => replaceMergeTags(v, testSubscriber));
     } else {
       ({ bodyParams, buttonUrlSuffix } = buildWhatsappTemplateParams(campaign.whatsapp_template as WhatsappTemplateName, {
         firstName: "Test Recipient",

@@ -43,6 +43,15 @@ export interface WhatsappTemplateDef {
    * Meta will reject the send outright (missing required button parameter).
    */
   reminderOnly?: boolean;
+  /**
+   * The literal approved MSG91 body copy, {{1}}/{{2}}/... placeholders in
+   * the same order buildWhatsappTemplateParams() returns them — exists
+   * purely so the admin UI can render a live preview of the actual message
+   * (see docs/whatsapp-templates.md, which this must stay in lockstep
+   * with). Never sent anywhere; MSG91 already has the template stored and
+   * is only ever given the param values, not this text.
+   */
+  body?: string;
 }
 
 export const WHATSAPP_TEMPLATES: WhatsappTemplateDef[] = [
@@ -51,12 +60,14 @@ export const WHATSAPP_TEMPLATES: WhatsappTemplateDef[] = [
     label: "Registration Confirmation",
     description: "The \"Your seat is confirmed\" message — sent automatically the instant someone registers. Selectable here so it can also be scheduled as a manual reminder or fired with Send Instantly (e.g. to re-notify everyone currently registered). Text-only, no button.",
     hasButton: false,
+    body: "Hi {{1}}, your seat for *{{2}}* is confirmed. It's scheduled on {{3}} at {{4}} ({{5}}). We'll send you the joining link and reminders here on WhatsApp.",
   },
   {
     name: "webinar_remind",
     label: "Webinar Reminder",
     description: "For the 3-day / 2-day / 1-day-before reminders. Includes the relative-time phrase (e.g. \"in 3 days\"). Text-only, no button.",
     hasButton: false,
+    body: "Hi {{1}}, this is a reminder that *{{2}}* is happening {{3}}, on {{4}} at {{5}} ({{6}}). We'll share the joining link closer to the start time.",
   },
   {
     name: "webinar_starting_soon",
@@ -64,6 +75,7 @@ export const WHATSAPP_TEMPLATES: WhatsappTemplateDef[] = [
     description: "For the 30-minutes-before reminder only. Includes a \"Join Webinar\" button linking to that recipient's specific session (requires the button to be a Dynamic URL in MSG91 — see docs/whatsapp-templates.md). Not available for general campaigns — there's no specific webinar to link to outside a reminder.",
     hasButton: true,
     reminderOnly: true,
+    body: "Hi {{1}}, your webinar *{{2}}* is starting in 30 minutes. Tap the button below to join when you're ready.",
   },
   {
     name: "webinar_live_now",
@@ -71,18 +83,21 @@ export const WHATSAPP_TEMPLATES: WhatsappTemplateDef[] = [
     description: "For the at-start reminder only. Includes a \"Join Webinar\" button linking to that recipient's specific session (requires the button to be a Dynamic URL in MSG91 — see docs/whatsapp-templates.md). Not available for general campaigns — there's no specific webinar to link to outside a reminder.",
     hasButton: true,
     reminderOnly: true,
+    body: "Hi {{1}}, your webinar *{{2}}* is starting now. Tap the button below to join right away.",
   },
   {
     name: "event_notify",
     label: "Event Reminder (generic)",
     description: "Generic fallback — text-only, no button. Available to pick manually but no longer any preset's default now that the specific templates are approved.",
     hasButton: false,
+    body: "Reminder: You registered for *{{1}}*. The event starts on *{{2}}* on *{{3}}*.",
   },
   {
     name: "webinar_correction",
     label: "Cancellation Correction",
     description: "For the rare case a cancellation notice went out in error — clarifies the webinar is still happening on its original date and the earlier cancellation message should be disregarded. Manual-only (no automatic trigger); send via a Campaign targeting this webinar's registrant tag. Requires MSG91/Meta approval before it can actually send — see docs/whatsapp-templates.md.",
     hasButton: false,
+    body: "Hi {{1}}, please disregard the earlier cancellation message for *{{2}}* — it was sent in error. The webinar is going ahead as scheduled on {{3}} at {{4}} ({{5}}). We're sorry for the confusion.",
   },
 ];
 

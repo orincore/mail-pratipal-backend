@@ -407,13 +407,15 @@ async function sendWhatsappLegForCampaign(campaign: any) {
       // A campaign whose whatsapp_template isn't one of the hardcoded
       // WHATSAPP_TEMPLATES (e.g. a template just approved in MSG91) has no
       // param builder to derive body params from — whatsapp_variables carries
-      // the admin-entered values instead, sent as-is to every recipient
-      // (no per-recipient personalization for these, since we don't know
-      // which slot, if any, is a name).
+      // the admin-entered values instead. Each value still goes through
+      // replaceMergeTags() so a variable like "{{first_name}}" resolves to
+      // this specific recipient's own data instead of being sent literally
+      // — that's what makes an otherwise-static custom template read as
+      // personalized per recipient.
       let bodyParams: string[];
       let buttonUrlSuffix: string | undefined;
       if (claimed.whatsapp_variables?.length) {
-        bodyParams = claimed.whatsapp_variables;
+        bodyParams = claimed.whatsapp_variables.map((v: string) => replaceMergeTags(v, sub));
       } else {
         ({ bodyParams, buttonUrlSuffix } = buildWhatsappTemplateParams(
           claimed.whatsapp_template as WhatsappTemplateName,

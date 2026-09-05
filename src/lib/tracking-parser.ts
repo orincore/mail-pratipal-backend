@@ -184,7 +184,9 @@ export function replaceMergeTags(
   const replacements: Record<string, string> = {
     "{{name}}": name,
     "{{first_name}}": firstName,
+    "{{last_name}}": subscriber.last_name || "",
     "{{email}}": subscriber.email || "",
+    "{{whatsapp_number}}": subscriber.whatsapp_number || "",
     "{{company}}": (subscriber.metadata?.get("company") as string) || config.branding.name,
     "{{webinar}}": (subscriber.metadata?.get("webinar") as string) || "Upcoming Webinar",
     "{{join_link}}": (subscriber.metadata?.get("webinar_join_link") as string) || config.branding.websiteUrl,

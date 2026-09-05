@@ -23,6 +23,12 @@ export interface IEmailCampaign extends Document {
    * derivation — see sendWhatsappLegForCampaign in queue-processor.ts.
    */
   whatsapp_variables?: string[];
+  /**
+   * Admin-pasted copy of a custom (non-hardcoded) template's approved MSG91
+   * body, {{1}}/{{2}}/... placeholders — powers the wizard's live preview
+   * only. Never read by the send path; MSG91 already has the real template.
+   */
+  whatsapp_preview_body?: string;
   audience: {
     lists: string[];
     tags: string[];
@@ -93,6 +99,7 @@ const EmailCampaignSchema = new Schema<IEmailCampaign>(
     whatsapp_template: { type: String },
     whatsapp_title: { type: String },
     whatsapp_variables: [{ type: String }],
+    whatsapp_preview_body: { type: String },
     audience: {
       lists: [{ type: String }],
       tags: [{ type: String }],
