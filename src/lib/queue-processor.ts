@@ -414,8 +414,9 @@ async function sendWhatsappLegForCampaign(campaign: any) {
       // personalized per recipient.
       let bodyParams: string[];
       let buttonUrlSuffix: string | undefined;
-      if (claimed.whatsapp_variables?.length) {
-        bodyParams = claimed.whatsapp_variables.map((v: string) => replaceMergeTags(v, sub));
+      if (claimed.whatsapp_variables?.length || claimed.whatsapp_button_param) {
+        bodyParams = (claimed.whatsapp_variables || []).map((v: string) => replaceMergeTags(v, sub));
+        buttonUrlSuffix = claimed.whatsapp_button_param ? replaceMergeTags(claimed.whatsapp_button_param, sub) : undefined;
       } else {
         ({ bodyParams, buttonUrlSuffix } = buildWhatsappTemplateParams(
           claimed.whatsapp_template as WhatsappTemplateName,

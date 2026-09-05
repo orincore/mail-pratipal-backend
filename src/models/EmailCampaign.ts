@@ -24,9 +24,18 @@ export interface IEmailCampaign extends Document {
    */
   whatsapp_variables?: string[];
   /**
-   * Admin-pasted copy of a custom (non-hardcoded) template's approved MSG91
-   * body, {{1}}/{{2}}/... placeholders — powers the wizard's live preview
-   * only. Never read by the send path; MSG91 already has the real template.
+   * Value for a custom template's URL button placeholder (MSG91's
+   * `button_1`), when its approved button URL has a {{n}} slot — e.g. a
+   * "track your order" link suffix. Separate from whatsapp_variables, which
+   * only ever maps to the body's body_N slots.
+   */
+  whatsapp_button_param?: string;
+  /**
+   * Manual fallback copy of a custom template's approved MSG91 body,
+   * {{1}}/{{2}}/... placeholders — only used for the wizard's live preview
+   * when MSG91's own template-list API didn't return a real body for this
+   * template. Never read by the send path; MSG91 already has the real
+   * template regardless of what's stored here.
    */
   whatsapp_preview_body?: string;
   audience: {
@@ -99,6 +108,7 @@ const EmailCampaignSchema = new Schema<IEmailCampaign>(
     whatsapp_template: { type: String },
     whatsapp_title: { type: String },
     whatsapp_variables: [{ type: String }],
+    whatsapp_button_param: { type: String },
     whatsapp_preview_body: { type: String },
     audience: {
       lists: [{ type: String }],

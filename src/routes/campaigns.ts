@@ -53,6 +53,31 @@ function sanitizeWhatsappVariables(variables: any): string[] {
     .filter((v) => v.length > 0);
 }
 
+/**
+ * A custom (non-hardcoded) template's exact variable requirements come
+ * straight from MSG91's own approved components (see whatsapp-template-sync.ts) —
+ * `remote.bodyVariableCount` counts the real {{n}} slots in the approved
+ * body, and a URL button only needs `whatsapp_button_param` when its own URL
+ * has a {{n}} slot. Falls back to requiring at least one body variable if
+ * MSG91's sync somehow didn't return real component data for this template.
+ */
+function validateCustomWhatsappTemplate(
+  match: { name: string; supported: boolean; remote?: { bodyVariableCount: number; buttons: { needsParam: boolean }[] } } | undefined,
+  variables: string[],
+  buttonParam?: string
+): string | null {
+  if (!match || match.supported) return null;
+  const requiredBodyVars = match.remote?.bodyVariableCount ?? 1;
+  const filledCount = variables.filter((v) => v.trim().length > 0).length;
+  if (filledCount < requiredBodyVars) {
+    return `"${match.name}" needs ${requiredBodyVars} variable value${requiredBodyVars === 1 ? "" : "s"} before launching`;
+  }
+  if (match.remote?.buttons?.some((b) => b.needsParam) && !buttonParam?.trim()) {
+    return `"${match.name}"'s button link needs a value before launching`;
+  }
+  return null;
+}
+
 function sanitizeAudience(audience: any) {
   const webinar_ids = Array.isArray(audience?.webinar_ids)
     ? audience.webinar_ids.filter((id: any) => mongoose.isValidObjectId(id))
@@ -146,6 +171,7 @@ router.post("/", async (req: AuthenticatedRequest, res: Response) => {
       whatsapp_template,
       whatsapp_title,
       whatsapp_variables,
+      whatsapp_button_param,
       whatsapp_preview_body,
       ab_test,
       save_as_draft,
@@ -173,17 +199,16 @@ router.post("/", async (req: AuthenticatedRequest, res: Response) => {
       // for a campaign, which has no webinar context (see meta endpoint above).
       // Note: this does NOT require `t.supported` — a template just approved
       // in MSG91 but not yet wired into whatsapp-templates.ts is still a
-      // valid pick here as long as the admin supplies whatsapp_variables for
-      // it (checked below), since sendWhatsappLegForCampaign sends those
-      // raw values instead of relying on a hardcoded param builder.
+      // valid pick here as long as it has the variables/button param its own
+      // approved components need (checked below), since sendWhatsappLegForCampaign
+      // sends those raw values instead of relying on a hardcoded param builder.
       const match = templates.find((t) => !t.reminderOnly && t.name === resolvedWhatsappTemplate);
       if (!match) {
         return res.status(400).json({ error: "A valid whatsapp_template is required for the WhatsApp channel" });
       }
-      if (!match.supported && sanitizedWhatsappVariables.length === 0) {
-        return res.status(400).json({
-          error: `"${match.name}" isn't a built-in template — enter its variable values before launching`,
-        });
+      const customTemplateError = validateCustomWhatsappTemplate(match, sanitizedWhatsappVariables, whatsapp_button_param);
+      if (customTemplateError) {
+        return res.status(400).json({ error: customTemplateError });
       }
     }
 
@@ -205,6 +230,7 @@ router.post("/", async (req: AuthenticatedRequest, res: Response) => {
       whatsapp_template: resolvedChannel !== "email" ? resolvedWhatsappTemplate : undefined,
       whatsapp_title: resolvedChannel !== "email" && whatsapp_title ? whatsapp_title : undefined,
       whatsapp_variables: resolvedChannel !== "email" ? sanitizedWhatsappVariables : undefined,
+      whatsapp_button_param: resolvedChannel !== "email" && whatsapp_button_param ? String(whatsapp_button_param).trim() : undefined,
       whatsapp_preview_body: resolvedChannel !== "email" && whatsapp_preview_body ? String(whatsapp_preview_body).slice(0, 2000) : undefined,
       ab_test: resolvedChannel !== "whatsapp" ? sanitizedAb : undefined,
       audience: sanitizeAudience(audience),
@@ -281,10 +307,13 @@ router.put("/", async (req: AuthenticatedRequest, res: Response) => {
       if (campaign.channel !== "email" && campaign.whatsapp_template) {
         const templates = await getMergedWhatsappTemplates();
         const match = templates.find((t) => t.name === campaign.whatsapp_template);
-        if (!match?.supported && (campaign.whatsapp_variables?.length || 0) === 0) {
-          return res.status(400).json({
-            error: `"${campaign.whatsapp_template}" isn't a built-in template — edit the draft to enter its variable values before launching`,
-          });
+        const customTemplateError = validateCustomWhatsappTemplate(
+          match,
+          campaign.whatsapp_variables || [],
+          campaign.whatsapp_button_param
+        );
+        if (customTemplateError) {
+          return res.status(400).json({ error: `${customTemplateError} — edit the draft first` });
         }
       }
 
@@ -316,6 +345,7 @@ router.put("/", async (req: AuthenticatedRequest, res: Response) => {
       "channel",
       "whatsapp_template",
       "whatsapp_title",
+      "whatsapp_button_param",
       "whatsapp_preview_body",
       "schedule_type",
       "scheduled_at",
@@ -617,6 +647,7 @@ router.post("/:id/rerun", async (req: AuthenticatedRequest, res: Response) => {
       whatsapp_template: campaign.whatsapp_template,
       whatsapp_title: campaign.whatsapp_title,
       whatsapp_variables: campaign.whatsapp_variables,
+      whatsapp_button_param: campaign.whatsapp_button_param,
       whatsapp_preview_body: campaign.whatsapp_preview_body,
       ab_test: campaign.ab_test,
       audience: campaign.audience,
@@ -656,7 +687,7 @@ router.post("/:id/test-send-whatsapp", async (req: AuthenticatedRequest, res: Re
 
     let bodyParams: string[];
     let buttonUrlSuffix: string | undefined;
-    if (campaign.whatsapp_variables?.length) {
+    if (campaign.whatsapp_variables?.length || campaign.whatsapp_button_param) {
       // Merge tags (e.g. {{first_name}}) an admin typed into a custom
       // template's variables need something to resolve against — there's no
       // real subscriber for a test send, so a synthetic one stands in.
@@ -667,7 +698,10 @@ router.post("/:id/test-send-whatsapp", async (req: AuthenticatedRequest, res: Re
         whatsapp_number: to,
         metadata: new Map(),
       } as any;
-      bodyParams = campaign.whatsapp_variables.map((v: string) => replaceMergeTags(v, testSubscriber));
+      bodyParams = (campaign.whatsapp_variables || []).map((v: string) => replaceMergeTags(v, testSubscriber));
+      buttonUrlSuffix = campaign.whatsapp_button_param
+        ? replaceMergeTags(campaign.whatsapp_button_param, testSubscriber)
+        : undefined;
     } else {
       ({ bodyParams, buttonUrlSuffix } = buildWhatsappTemplateParams(campaign.whatsapp_template as WhatsappTemplateName, {
         firstName: "Test Recipient",
