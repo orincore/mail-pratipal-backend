@@ -9,6 +9,20 @@ export interface IEmailCampaign extends Document {
   template_id?: mongoose.Types.ObjectId;
   channel: "email" | "whatsapp" | "both";
   whatsapp_template?: string;
+  /**
+   * Overrides the {{webinarTitle}} slot the hardcoded templates in
+   * whatsapp-templates.ts fill with campaign.name by default — lets an admin
+   * send different customer-facing copy than the internal campaign name.
+   */
+  whatsapp_title?: string;
+  /**
+   * Raw body_N parameter values, in order, for a WhatsApp template that isn't
+   * one of the hardcoded WHATSAPP_TEMPLATES (e.g. a template just approved in
+   * MSG91 that the code has no per-template param builder for yet). When
+   * set, these are sent as-is instead of the automatic firstName/title/date
+   * derivation — see sendWhatsappLegForCampaign in queue-processor.ts.
+   */
+  whatsapp_variables?: string[];
   audience: {
     lists: string[];
     tags: string[];
@@ -77,6 +91,8 @@ const EmailCampaignSchema = new Schema<IEmailCampaign>(
     template_id: { type: Schema.Types.ObjectId, ref: "EmailTemplate" },
     channel: { type: String, enum: ["email", "whatsapp", "both"], default: "email", index: true },
     whatsapp_template: { type: String },
+    whatsapp_title: { type: String },
+    whatsapp_variables: [{ type: String }],
     audience: {
       lists: [{ type: String }],
       tags: [{ type: String }],

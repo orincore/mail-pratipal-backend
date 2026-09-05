@@ -46,6 +46,13 @@ function sanitizeAbTest(abTest: any) {
   };
 }
 
+function sanitizeWhatsappVariables(variables: any): string[] {
+  if (!Array.isArray(variables)) return [];
+  return variables
+    .map((v) => (typeof v === "string" ? v.trim() : ""))
+    .filter((v) => v.length > 0);
+}
+
 function sanitizeAudience(audience: any) {
   const webinar_ids = Array.isArray(audience?.webinar_ids)
     ? audience.webinar_ids.filter((id: any) => mongoose.isValidObjectId(id))
@@ -137,6 +144,8 @@ router.post("/", async (req: AuthenticatedRequest, res: Response) => {
       scheduled_at,
       channel,
       whatsapp_template,
+      whatsapp_title,
+      whatsapp_variables,
       ab_test,
       save_as_draft,
     } = req.body;
@@ -156,13 +165,24 @@ router.post("/", async (req: AuthenticatedRequest, res: Response) => {
     }
 
     let resolvedWhatsappTemplate: string | undefined = whatsapp_template;
+    const sanitizedWhatsappVariables = sanitizeWhatsappVariables(whatsapp_variables);
     if (!isDraft && resolvedChannel !== "email") {
       const templates = await getMergedWhatsappTemplates();
       // reminderOnly templates need a real Webinar to link to — never valid
       // for a campaign, which has no webinar context (see meta endpoint above).
-      const valid = templates.some((t) => t.supported && !t.reminderOnly && t.name === resolvedWhatsappTemplate);
-      if (!valid) {
+      // Note: this does NOT require `t.supported` — a template just approved
+      // in MSG91 but not yet wired into whatsapp-templates.ts is still a
+      // valid pick here as long as the admin supplies whatsapp_variables for
+      // it (checked below), since sendWhatsappLegForCampaign sends those
+      // raw values instead of relying on a hardcoded param builder.
+      const match = templates.find((t) => !t.reminderOnly && t.name === resolvedWhatsappTemplate);
+      if (!match) {
         return res.status(400).json({ error: "A valid whatsapp_template is required for the WhatsApp channel" });
+      }
+      if (!match.supported && sanitizedWhatsappVariables.length === 0) {
+        return res.status(400).json({
+          error: `"${match.name}" isn't a built-in template — enter its variable values before launching`,
+        });
       }
     }
 
@@ -182,6 +202,8 @@ router.post("/", async (req: AuthenticatedRequest, res: Response) => {
       template_id: resolvedChannel !== "whatsapp" && template_id ? template_id : undefined,
       channel: resolvedChannel,
       whatsapp_template: resolvedChannel !== "email" ? resolvedWhatsappTemplate : undefined,
+      whatsapp_title: resolvedChannel !== "email" && whatsapp_title ? whatsapp_title : undefined,
+      whatsapp_variables: resolvedChannel !== "email" ? sanitizedWhatsappVariables : undefined,
       ab_test: resolvedChannel !== "whatsapp" ? sanitizedAb : undefined,
       audience: sanitizeAudience(audience),
       schedule_type: schedule_type || "immediate",
@@ -254,6 +276,15 @@ router.put("/", async (req: AuthenticatedRequest, res: Response) => {
       if (campaign.channel !== "email" && !campaign.whatsapp_template) {
         return res.status(400).json({ error: "Draft is missing a WhatsApp template — edit it before launching" });
       }
+      if (campaign.channel !== "email" && campaign.whatsapp_template) {
+        const templates = await getMergedWhatsappTemplates();
+        const match = templates.find((t) => t.name === campaign.whatsapp_template);
+        if (!match?.supported && (campaign.whatsapp_variables?.length || 0) === 0) {
+          return res.status(400).json({
+            error: `"${campaign.whatsapp_template}" isn't a built-in template — edit the draft to enter its variable values before launching`,
+          });
+        }
+      }
 
       const { schedule_type, scheduled_at } = req.body;
       if (schedule_type) campaign.schedule_type = schedule_type;
@@ -282,11 +313,15 @@ router.put("/", async (req: AuthenticatedRequest, res: Response) => {
       "template_id",
       "channel",
       "whatsapp_template",
+      "whatsapp_title",
       "schedule_type",
       "scheduled_at",
     ];
     for (const field of allowedFields) {
       if (field in updateFields) editable[field] = updateFields[field];
+    }
+    if ("whatsapp_variables" in updateFields) {
+      editable.whatsapp_variables = sanitizeWhatsappVariables(updateFields.whatsapp_variables);
     }
     if ("audience" in updateFields) editable.audience = sanitizeAudience(updateFields.audience);
     if ("ab_test" in updateFields) editable.ab_test = sanitizeAbTest(updateFields.ab_test);
@@ -577,6 +612,8 @@ router.post("/:id/rerun", async (req: AuthenticatedRequest, res: Response) => {
       template_id: campaign.template_id,
       channel: campaign.channel,
       whatsapp_template: campaign.whatsapp_template,
+      whatsapp_title: campaign.whatsapp_title,
+      whatsapp_variables: campaign.whatsapp_variables,
       ab_test: campaign.ab_test,
       audience: campaign.audience,
       schedule_type,
@@ -613,12 +650,18 @@ router.post("/:id/test-send-whatsapp", async (req: AuthenticatedRequest, res: Re
       return res.status(400).json({ error: "This campaign has no WhatsApp template configured" });
     }
 
-    const { bodyParams, buttonUrlSuffix } = buildWhatsappTemplateParams(campaign.whatsapp_template as WhatsappTemplateName, {
-      firstName: "Test Recipient",
-      webinarTitle: campaign.name,
-      startsAt: campaign.scheduled_at || new Date(),
-      timezone: config.branding.timezone,
-    });
+    let bodyParams: string[];
+    let buttonUrlSuffix: string | undefined;
+    if (campaign.whatsapp_variables?.length) {
+      bodyParams = campaign.whatsapp_variables;
+    } else {
+      ({ bodyParams, buttonUrlSuffix } = buildWhatsappTemplateParams(campaign.whatsapp_template as WhatsappTemplateName, {
+        firstName: "Test Recipient",
+        webinarTitle: campaign.whatsapp_title || campaign.name,
+        startsAt: campaign.scheduled_at || new Date(),
+        timezone: config.branding.timezone,
+      }));
+    }
 
     console.log(`Campaign Test WhatsApp Send: Dispatching test message for campaign ${campaign.name} to ${to}`);
 

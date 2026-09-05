@@ -13,6 +13,40 @@ const router = Router();
 
 router.use(authMiddleware);
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * The instant of local midnight, for whatever calendar day `instant` falls
+ * on in `timeZone` — e.g. passing "now" returns "today" 00:00:00 in that
+ * zone, as an absolute Date (not a Date built from process-local fields).
+ *
+ * Every "Today"/day-boundary computation in this route needs to line up
+ * with the business's own calendar day (config.branding.timezone, IST),
+ * not whatever timezone the Node process happens to be running in. Cloud
+ * hosts default containers to UTC, which sits 5:30h behind IST; the old
+ * code built boundaries with `Date#setHours()`, which resolves "midnight"
+ * in the *process's* local zone. In the early IST morning that silently
+ * queries UTC's midnight instead — a window that has barely started (or,
+ * depending on the exact time of day, one that excludes the previous
+ * evening's activity which is still "today" in IST's small hours) — which
+ * is exactly why the "Today" filter could show every metric as 0 despite
+ * real send activity.
+ */
+function startOfDayInTimezone(instant: Date, timeZone: string): Date {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).formatToParts(instant);
+  const get = (type: string) => Number(parts.find((p) => p.type === type)?.value || 0);
+  // Intl can format midnight as hour "24" under hour12: false — normalize to 0.
+  const hour = get("hour") % 24;
+  const msIntoDay = ((hour * 60 + get("minute")) * 60 + get("second")) * 1000 + instant.getMilliseconds();
+  return new Date(instant.getTime() - msIntoDay);
+}
+
 // GET /api/auth/me - Retrieve current verified user payload
 router.get("/auth/me", async (req: AuthenticatedRequest, res: Response) => {
   return res.json({ user: req.user });
@@ -42,14 +76,16 @@ router.get("/dashboard-stats", async (req: AuthenticatedRequest, res: Response) 
     const timeframe = (req.query.timeframe as string) || "weekly";
 
     // A custom range is the only one with a real upper bound — the presets
-    // all mean "since X, through right now." Parsed as local calendar dates
-    // (not `new Date("YYYY-MM-DD")`, which lands on UTC midnight) so "Jan 5"
-    // means the same day here as it did in the date picker.
+    // all mean "since X, through right now." Parsed as a calendar date in
+    // the business's own timezone (not the server process's) so "Jan 5"
+    // means the same day here as it did in the date picker regardless of
+    // which timezone this Node process happens to be running in.
     const parseLocalDate = (s?: string): Date | null => {
       const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s || "");
       if (!m) return null;
-      const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
-      return Number.isNaN(d.getTime()) ? null : d;
+      const utcMidnight = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
+      if (Number.isNaN(utcMidnight.getTime())) return null;
+      return startOfDayInTimezone(utcMidnight, config.branding.timezone);
     };
     // Per-day stats below cost 4 count queries each; an unbounded custom
     // range (someone fat-fingering a decade) would turn into thousands of
@@ -57,38 +93,36 @@ router.get("/dashboard-stats", async (req: AuthenticatedRequest, res: Response) 
     // two dates" without opening that door.
     const MAX_CUSTOM_RANGE_DAYS = 90;
 
-    // 1. Determine date filter boundaries
-    let startOfPeriod = new Date();
+    // 1. Determine date filter boundaries — all computed as absolute instants
+    // via pure day-count arithmetic off `todayStart` (today's midnight in
+    // config.branding.timezone), never via Date#setHours()/setDate(), which
+    // resolve to the process's own local timezone instead.
+    const todayStart = startOfDayInTimezone(new Date(), config.branding.timezone);
+    let startOfPeriod = todayStart;
     let endOfPeriod: Date | null = null; // non-null only for a bounded custom range
     if (timeframe === "custom") {
       const parsedFrom = parseLocalDate(req.query.from as string);
       const parsedTo = parseLocalDate(req.query.to as string);
       if (parsedFrom && parsedTo) {
         // Accept either order — swap if the two dates arrived backwards.
-        startOfPeriod = parsedFrom <= parsedTo ? parsedFrom : parsedTo;
-        endOfPeriod = parsedFrom <= parsedTo ? parsedTo : parsedFrom;
-        startOfPeriod.setHours(0, 0, 0, 0);
-        endOfPeriod.setHours(23, 59, 59, 999);
-        const spanDays = Math.floor((endOfPeriod.getTime() - startOfPeriod.getTime()) / 86400000);
+        const [from, to] = parsedFrom.getTime() <= parsedTo.getTime() ? [parsedFrom, parsedTo] : [parsedTo, parsedFrom];
+        startOfPeriod = from;
+        endOfPeriod = new Date(to.getTime() + DAY_MS - 1); // end of that calendar day
+        const spanDays = Math.floor((endOfPeriod.getTime() - startOfPeriod.getTime()) / DAY_MS);
         if (spanDays > MAX_CUSTOM_RANGE_DAYS) {
-          startOfPeriod = new Date(endOfPeriod);
-          startOfPeriod.setDate(startOfPeriod.getDate() - MAX_CUSTOM_RANGE_DAYS);
-          startOfPeriod.setHours(0, 0, 0, 0);
+          startOfPeriod = new Date(endOfPeriod.getTime() - MAX_CUSTOM_RANGE_DAYS * DAY_MS + 1);
         }
       } else {
         // Malformed/missing dates — fall back to the weekly default rather
         // than erroring the whole dashboard out.
-        startOfPeriod.setDate(startOfPeriod.getDate() - 6);
-        startOfPeriod.setHours(0, 0, 0, 0);
+        startOfPeriod = new Date(todayStart.getTime() - 6 * DAY_MS);
       }
     } else if (timeframe === "daily") {
-      startOfPeriod.setHours(0, 0, 0, 0);
+      startOfPeriod = todayStart;
     } else if (timeframe === "monthly") {
-      startOfPeriod.setDate(startOfPeriod.getDate() - 29);
-      startOfPeriod.setHours(0, 0, 0, 0);
+      startOfPeriod = new Date(todayStart.getTime() - 29 * DAY_MS);
     } else { // default to weekly (last 7 days)
-      startOfPeriod.setDate(startOfPeriod.getDate() - 6);
-      startOfPeriod.setHours(0, 0, 0, 0);
+      startOfPeriod = new Date(todayStart.getTime() - 6 * DAY_MS);
     }
 
     const eventQuery = endOfPeriod
@@ -119,7 +153,12 @@ router.get("/dashboard-stats", async (req: AuthenticatedRequest, res: Response) 
     // reports a "read" count for the period instead, so ask it directly
     // rather than a DB query. It's a real network call to a third party —
     // one failure here must never break the rest of the dashboard.
-    const toDateStr = (d: Date) => d.toISOString().slice(0, 10);
+    // en-CA renders as YYYY-MM-DD directly — formatted in the business
+    // timezone since `d` is now a business-timezone-midnight instant, and
+    // `.toISOString()` (always UTC) would render the wrong calendar date
+    // whenever that timezone sits ahead of UTC (e.g. IST rolls the date
+    // forward ~5.5h before UTC does).
+    const toDateStr = (d: Date) => d.toLocaleDateString("en-CA", { timeZone: config.branding.timezone });
     let totalWhatsappOpens = 0;
     try {
       const analytics = await getWhatsappAnalytics(toDateStr(startOfPeriod), toDateStr(endOfPeriod || new Date()));
@@ -149,14 +188,14 @@ router.get("/dashboard-stats", async (req: AuthenticatedRequest, res: Response) 
 
     if (timeframe === "custom" && endOfPeriod) {
       // One point per calendar day across whatever range was picked —
-      // already clamped to MAX_CUSTOM_RANGE_DAYS above.
-      const totalDays = Math.floor((endOfPeriod.getTime() - startOfPeriod.getTime()) / 86400000) + 1;
+      // already clamped to MAX_CUSTOM_RANGE_DAYS above. Pure ms arithmetic
+      // off `startOfPeriod` (already the business timezone's midnight for
+      // that day) rather than Date#setDate()/setHours(), which resolve
+      // against the process's own local timezone instead.
+      const totalDays = Math.round((endOfPeriod.getTime() - startOfPeriod.getTime() + 1) / DAY_MS);
       for (let i = 0; i < totalDays; i++) {
-        const day = new Date(startOfPeriod);
-        day.setDate(day.getDate() + i);
-
-        const startOfDay = new Date(day.setHours(0, 0, 0, 0));
-        const endOfDay = new Date(day.setHours(23, 59, 59, 999));
+        const startOfDay = new Date(startOfPeriod.getTime() + i * DAY_MS);
+        const endOfDay = new Date(startOfDay.getTime() + DAY_MS - 1);
 
         const sent = await EmailEvent.countDocuments({
           event_type: "sent",
@@ -183,7 +222,7 @@ router.get("/dashboard-stats", async (req: AuthenticatedRequest, res: Response) 
 
         chartStatsPush(
           dailyStats,
-          day.toLocaleDateString("en-IN", { month: "short", day: "numeric" }),
+          startOfDay.toLocaleDateString("en-IN", { month: "short", day: "numeric", timeZone: config.branding.timezone }),
           sent,
           opens,
           whatsappSent,
@@ -191,12 +230,11 @@ router.get("/dashboard-stats", async (req: AuthenticatedRequest, res: Response) 
         );
       }
     } else if (timeframe === "daily") {
-      // 24 hours of today
+      // 24 hours of today, in the business timezone.
+      const HOUR_MS = 60 * 60 * 1000;
       for (let i = 0; i < 24; i++) {
-        const startOfHour = new Date(startOfPeriod);
-        startOfHour.setHours(i, 0, 0, 0);
-        const endOfHour = new Date(startOfPeriod);
-        endOfHour.setHours(i, 59, 59, 999);
+        const startOfHour = new Date(startOfPeriod.getTime() + i * HOUR_MS);
+        const endOfHour = new Date(startOfHour.getTime() + HOUR_MS - 1);
 
         const sent = await EmailEvent.countDocuments({
           event_type: "sent",
@@ -226,11 +264,8 @@ router.get("/dashboard-stats", async (req: AuthenticatedRequest, res: Response) 
     } else if (timeframe === "monthly") {
       // 30 days
       for (let i = 0; i < 30; i++) {
-        const day = new Date(startOfPeriod);
-        day.setDate(day.getDate() + i);
-
-        const startOfDay = new Date(day.setHours(0, 0, 0, 0));
-        const endOfDay = new Date(day.setHours(23, 59, 59, 999));
+        const startOfDay = new Date(startOfPeriod.getTime() + i * DAY_MS);
+        const endOfDay = new Date(startOfDay.getTime() + DAY_MS - 1);
 
         const sent = await EmailEvent.countDocuments({
           event_type: "sent",
@@ -257,7 +292,7 @@ router.get("/dashboard-stats", async (req: AuthenticatedRequest, res: Response) 
 
         chartStatsPush(
           dailyStats,
-          day.toLocaleDateString("en-IN", { month: "short", day: "numeric" }),
+          startOfDay.toLocaleDateString("en-IN", { month: "short", day: "numeric", timeZone: config.branding.timezone }),
           sent,
           opens,
           whatsappSent,
@@ -267,11 +302,8 @@ router.get("/dashboard-stats", async (req: AuthenticatedRequest, res: Response) 
     } else {
       // weekly (7 days)
       for (let i = 0; i < 7; i++) {
-        const day = new Date(startOfPeriod);
-        day.setDate(day.getDate() + i);
-
-        const startOfDay = new Date(day.setHours(0, 0, 0, 0));
-        const endOfDay = new Date(day.setHours(23, 59, 59, 999));
+        const startOfDay = new Date(startOfPeriod.getTime() + i * DAY_MS);
+        const endOfDay = new Date(startOfDay.getTime() + DAY_MS - 1);
 
         const sent = await EmailEvent.countDocuments({
           event_type: "sent",
@@ -298,7 +330,7 @@ router.get("/dashboard-stats", async (req: AuthenticatedRequest, res: Response) 
 
         chartStatsPush(
           dailyStats,
-          day.toLocaleDateString("en-IN", { month: "short", day: "numeric" }),
+          startOfDay.toLocaleDateString("en-IN", { month: "short", day: "numeric", timeZone: config.branding.timezone }),
           sent,
           opens,
           whatsappSent,

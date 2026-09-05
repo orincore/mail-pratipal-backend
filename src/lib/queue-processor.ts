@@ -404,15 +404,27 @@ async function sendWhatsappLegForCampaign(campaign: any) {
     }
 
     try {
-      const { bodyParams, buttonUrlSuffix } = buildWhatsappTemplateParams(
-        claimed.whatsapp_template as WhatsappTemplateName,
-        {
-          firstName: sub.first_name || "there",
-          webinarTitle: claimed.name,
-          startsAt: claimed.scheduled_at || claimed.created_at || new Date(),
-          timezone: config.branding.timezone,
-        }
-      );
+      // A campaign whose whatsapp_template isn't one of the hardcoded
+      // WHATSAPP_TEMPLATES (e.g. a template just approved in MSG91) has no
+      // param builder to derive body params from — whatsapp_variables carries
+      // the admin-entered values instead, sent as-is to every recipient
+      // (no per-recipient personalization for these, since we don't know
+      // which slot, if any, is a name).
+      let bodyParams: string[];
+      let buttonUrlSuffix: string | undefined;
+      if (claimed.whatsapp_variables?.length) {
+        bodyParams = claimed.whatsapp_variables;
+      } else {
+        ({ bodyParams, buttonUrlSuffix } = buildWhatsappTemplateParams(
+          claimed.whatsapp_template as WhatsappTemplateName,
+          {
+            firstName: sub.first_name || "there",
+            webinarTitle: claimed.whatsapp_title || claimed.name,
+            startsAt: claimed.scheduled_at || claimed.created_at || new Date(),
+            timezone: config.branding.timezone,
+          }
+        ));
+      }
 
       const result = await sendWhatsappTemplate({
         to: sub.whatsapp_number,
