@@ -2,7 +2,7 @@ import { Worker } from "bullmq";
 import WebinarReminder from "../../models/WebinarReminder";
 import Webinar from "../../models/Webinar";
 import { fanOutReminderLeg } from "./fan-out";
-import { syncRegistrantsForWebinar } from "../webinar-sync";
+import { syncRegistrantsForWebinar, syncWebinarsFromWebsite } from "../webinar-sync";
 import { redisConnection, queuePrefix } from "./connection";
 import { reminderSchedulerQueue, scheduleReminderJob, reminderJobId } from "./queues";
 
@@ -93,9 +93,30 @@ export async function reconcileDueReminders(): Promise<void> {
   }
 }
 
+// Background sync of registration windows + registrant lists from the main
+// website. The only other trigger is someone opening the CRM Reminders page,
+// so without this a window created on the website never reached the CRM
+// until an admin happened to open it — and a date change made on the website
+// never re-timed that webinar's reminders at all if nobody did.
+export async function syncWebinarsInBackground(): Promise<void> {
+  await syncWebinarsFromWebsite(true);
+  const upcoming = await Webinar.find({ status: "upcoming" });
+  for (const webinar of upcoming) {
+    // Not forced — the per-webinar 5-minute throttle still applies, and each
+    // reminder force-syncs its own list right before dispatch anyway.
+    await syncRegistrantsForWebinar(webinar, false).catch((err) =>
+      console.error("Background registrant sync failed:", webinar.source_window_id, err)
+    );
+  }
+}
+
 async function processScheduler(job: { name: string; data: DispatchJobData }): Promise<void> {
   if (job.name === "reconcile") {
     await reconcileDueReminders();
+    return;
+  }
+  if (job.name === "sync-webinars") {
+    await syncWebinarsInBackground();
     return;
   }
   await handleDispatch(job.data.reminderId);
@@ -106,6 +127,16 @@ export const reminderSchedulerWorker = new Worker("reminder-scheduler", processS
   prefix: queuePrefix,
   concurrency: 5,
 });
+
+/** Registers the repeatable webinar sync job — call once at worker boot. */
+export async function registerWebinarSyncSchedule(): Promise<void> {
+  await reminderSchedulerQueue.upsertJobScheduler(
+    "sync-webinars",
+    { every: 60 * 1000 },
+    // Runs every minute — don't let a completed/failed job pile up in Redis per tick.
+    { name: "sync-webinars", data: {}, opts: { removeOnComplete: true, removeOnFail: 50 } }
+  );
+}
 
 /** Registers the repeatable reconciliation job — call once at worker boot. */
 export async function registerReconciliationSchedule(): Promise<void> {

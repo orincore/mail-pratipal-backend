@@ -11,7 +11,13 @@ import { connectDB } from "../lib/db";
 import { emailSendWorker } from "../lib/queue/email-send.worker";
 import { whatsappSendWorker } from "../lib/queue/whatsapp-send.worker";
 import { reminderFinalizeWorker } from "../lib/queue/reminder-finalize.worker";
-import { reminderSchedulerWorker, registerReconciliationSchedule, reconcileDueReminders } from "../lib/queue/reminder-scheduler.worker";
+import {
+  reminderSchedulerWorker,
+  registerReconciliationSchedule,
+  reconcileDueReminders,
+  registerWebinarSyncSchedule,
+  syncWebinarsInBackground,
+} from "../lib/queue/reminder-scheduler.worker";
 
 async function main() {
   await connectDB();
@@ -26,6 +32,10 @@ async function main() {
   // 5-minute tick, so a restart doesn't leave a due reminder stalled longer
   // than necessary.
   await reconcileDueReminders().catch((err) => console.error("Startup reconciliation failed:", err));
+
+  await registerWebinarSyncSchedule();
+  // Same idea: pull website windows now rather than a minute from now.
+  syncWebinarsInBackground().catch((err) => console.error("Startup webinar sync failed:", err));
 
   const workers = [emailSendWorker, whatsappSendWorker, reminderFinalizeWorker, reminderSchedulerWorker];
   for (const worker of workers) {

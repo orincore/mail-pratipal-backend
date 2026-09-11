@@ -50,6 +50,8 @@ const DEFAULT_EMAIL_TEMPLATE_NAME_FOR_PRESET: Record<string, string> = {
   at_start: "Webinar Live Now",
 };
 
+const LIST_SYNC_WAIT_MS = 4000;
+
 async function registrantCount(webinar: { source_window_id: string }) {
   return EmailSubscriber.countDocuments({ tags: webinarTag(webinar) });
 }
@@ -79,27 +81,28 @@ router.get("/meta/whatsapp-templates", async (_req: AuthenticatedRequest, res: R
 // GET /api/webinars - list webinars with live registrant counts + reminders
 router.get("/", async (req: AuthenticatedRequest, res: Response) => {
   try {
-    // Auto-sync, replacing the old manual "Sync Now" button: both sync
-    // functions are internally throttled to once per 5 minutes (see
-    // webinar-sync.ts's SYNC_THROTTLE_MS) and were already written to be
-    // "safe to call on every sweep tick" — so calling them here unconditionally
-    // makes every page load double as that tick, with no separate cron needed.
-    // Fire-and-forget (not awaited): this list reads straight from MongoDB, so
-    // a slow upstream website fetch must never block the page — a sync that's
-    // still in flight just means this response is the pre-sync state, caught
-    // up by the next load.
-    syncWebinarsFromWebsite(false).catch((err) => console.error("Auto webinar sync failed:", err));
+    // Auto-sync on page load, on top of the queue worker's background sync
+    // (see registerWebinarSyncSchedule). The window list sync is awaited —
+    // capped at LIST_SYNC_WAIT_MS — because it used to be fire-and-forget,
+    // which meant this response was always the PRE-sync state: a window just
+    // created on the website only showed up on a second reload after the
+    // sync happened to finish. The cap keeps a slow website from blocking the
+    // page; a sync still running past it just lands on the next refresh.
+    const listSync = syncWebinarsFromWebsite(false).catch((err) => console.error("Auto webinar sync failed:", err));
+    await Promise.race([listSync, new Promise((resolve) => setTimeout(resolve, LIST_SYNC_WAIT_MS))]);
 
     // syncRegistrantsForWebinar mutates and .save()s the doc it's given, so
     // it needs real Mongoose documents — the .lean() query below (used for
     // the actual response, for speed) would silently no-op it instead.
-    Webinar.find({ status: "upcoming" }).then((upcoming) => {
-      for (const w of upcoming) {
-        syncRegistrantsForWebinar(w, false).catch((err) =>
-          console.error("Auto registrant sync failed:", w.source_window_id, err)
-        );
-      }
-    });
+    Webinar.find({ status: "upcoming" })
+      .then((upcoming) => {
+        for (const w of upcoming) {
+          syncRegistrantsForWebinar(w, false).catch((err) =>
+            console.error("Auto registrant sync failed:", w.source_window_id, err)
+          );
+        }
+      })
+      .catch((err) => console.error("Auto registrant sync failed:", err));
 
     const webinars = await Webinar.find().sort({ updated_at: -1 }).lean();
 

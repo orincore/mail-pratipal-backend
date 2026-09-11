@@ -72,8 +72,18 @@ export async function sendLifecycleWhatsapp(
   }
 }
 
-const SYNC_THROTTLE_MS = 5 * 60 * 1000; // don't hit the main website more than once per 5 min
+const SYNC_THROTTLE_MS = 5 * 60 * 1000; // registrant lists: don't hit the main website more than once per 5 min
+// The window list is one small request, and it's what makes a newly created
+// window show up in the Reminders page — so it's allowed far more often.
+const WEBINAR_LIST_THROTTLE_MS = 30 * 1000;
+const WEBSITE_FETCH_TIMEOUT_MS = 15 * 1000;
+// A webinar only flips to "completed" this long after it starts. Flipping it
+// the instant starts_at passes raced the "at start" reminder: a sync landing a
+// second after start marked it completed before the dispatch job read the
+// status, and handleDispatch skips anything that isn't "upcoming".
+const COMPLETION_GRACE_MS = 3 * 60 * 60 * 1000;
 let lastWebinarListSyncAt = 0;
+let webinarListSyncInFlight: Promise<void> | null = null;
 const lastRegistrantSyncAt = new Map<string, number>();
 
 // Tag subscribers per *occurrence* (window), not per landing page — the same
@@ -106,16 +116,28 @@ export function computeSendAt(
 /**
  * Pulls webinar occurrences (InvitationWindows) from the main website and
  * upserts them, one Webinar per window. Throttled internally so it's safe to
- * call on every sweep tick.
+ * call on every sweep tick, and concurrent callers share one in-flight run
+ * instead of racing each other's upserts.
  */
-export async function syncWebinarsFromWebsite(force = false): Promise<void> {
+export function syncWebinarsFromWebsite(force = false): Promise<void> {
+  if (webinarListSyncInFlight) return webinarListSyncInFlight;
   const now = Date.now();
-  if (!force && now - lastWebinarListSyncAt < SYNC_THROTTLE_MS) return;
-  if (!config.mainWebsite.apiKey) return;
+  if (!force && now - lastWebinarListSyncAt < WEBINAR_LIST_THROTTLE_MS) return Promise.resolve();
+  if (!config.mainWebsite.apiKey) return Promise.resolve();
   lastWebinarListSyncAt = now;
 
+  webinarListSyncInFlight = runWebinarListSync().finally(() => {
+    webinarListSyncInFlight = null;
+  });
+  return webinarListSyncInFlight;
+}
+
+async function runWebinarListSync(): Promise<void> {
   const res = await fetch(`${config.mainWebsite.url}/api/integrations/webinars`, {
     headers: { "x-api-key": config.mainWebsite.apiKey },
+    // Without a timeout, one hung request blocks every later sync (they all
+    // join this in-flight run).
+    signal: AbortSignal.timeout(WEBSITE_FETCH_TIMEOUT_MS),
   });
   if (!res.ok) {
     console.error("syncWebinarsFromWebsite: fetch failed", res.status, await res.text().catch(() => ""));
@@ -125,86 +147,117 @@ export async function syncWebinarsFromWebsite(force = false): Promise<void> {
 
   for (const w of webinars || []) {
     if (!w.webinar_starts_at) continue;
+    // One bad window (or a duplicate-key race with another process's sync)
+    // must not stop every window after it from syncing.
+    try {
+      await syncOneWebinar(w);
+    } catch (err) {
+      console.error("syncWebinarsFromWebsite: failed to sync window", w.id, err);
+    }
+  }
 
-    const existing = await Webinar.findOne({ source_window_id: w.id });
-    const newStartsAt = new Date(w.webinar_starts_at);
-    const startsAtChanged = existing && existing.starts_at.getTime() !== newStartsAt.getTime();
+  // Webinars whose window was deleted on the website (or whose page was
+  // unpublished) never come back in the list above, so nothing else would
+  // ever move them out of "upcoming" — they sat there forever, and every
+  // Reminders page load kept trying to sync their registrants.
+  await Webinar.updateMany(
+    { status: "upcoming", starts_at: { $lt: new Date(Date.now() - COMPLETION_GRACE_MS) } },
+    { $set: { status: "completed" } }
+  );
+}
 
-    const webinar = await Webinar.findOneAndUpdate(
-      { source_window_id: w.id },
-      {
-        $set: {
-          slug: w.slug,
-          title: w.title,
-          window_name: w.window_name || undefined,
-          starts_at: newStartsAt,
-          timezone: w.webinar_timezone || config.branding.timezone,
-          registration_start: w.registration_start ? new Date(w.registration_start) : undefined,
-          registration_end: w.registration_end ? new Date(w.registration_end) : undefined,
-          join_link: w.join_link || undefined,
-          join_platform: w.join_platform || undefined,
-        },
-        $setOnInsert: { status: "upcoming" },
+async function syncOneWebinar(w: any): Promise<void> {
+  const existing = await Webinar.findOne({ source_window_id: w.id });
+  const newStartsAt = new Date(w.webinar_starts_at);
+  const startsAtChanged = existing && existing.starts_at.getTime() !== newStartsAt.getTime();
+
+  const webinar = await Webinar.findOneAndUpdate(
+    { source_window_id: w.id },
+    {
+      $set: {
+        slug: w.slug,
+        title: w.title,
+        window_name: w.window_name || undefined,
+        starts_at: newStartsAt,
+        timezone: w.webinar_timezone || config.branding.timezone,
+        registration_start: w.registration_start ? new Date(w.registration_start) : undefined,
+        registration_end: w.registration_end ? new Date(w.registration_end) : undefined,
+        join_link: w.join_link || undefined,
+        join_platform: w.join_platform || undefined,
       },
-      { upsert: true, new: true }
-    );
+      $setOnInsert: { status: "upcoming" },
+    },
+    { upsert: true, new: true }
+  );
 
-    // Nothing else ever transitions a webinar out of "upcoming" once its
-    // start time passes — cancellation is the only other status change, set
-    // manually via PUT /api/webinars/:id. Without this, the dashboard shows
-    // "upcoming" forever for webinars that happened weeks ago.
-    if (webinar.status === "upcoming" && webinar.starts_at.getTime() < Date.now()) {
-      webinar.status = "completed";
-      await webinar.save();
+  // Nothing else ever transitions a webinar out of "upcoming" once its
+  // start time passes — cancellation is the only other status change, set
+  // manually via PUT /api/webinars/:id. Without this, the dashboard shows
+  // "upcoming" forever for webinars that happened weeks ago. Held off for
+  // COMPLETION_GRACE_MS so the "at start" reminder still dispatches.
+  if (webinar.status === "upcoming" && webinar.starts_at.getTime() < Date.now() - COMPLETION_GRACE_MS) {
+    webinar.status = "completed";
+    await webinar.save();
+  }
+
+  if (startsAtChanged) {
+    // Never touch reminders that already fired/are firing, and never
+    // reinterpret an intentionally-fixed custom absolute date. $or on both
+    // dispatch fields — an email-only query here used to silently skip
+    // rescheduling whatsapp-only reminders when a webinar's start moved.
+    const pendingReminders = await WebinarReminder.find({
+      webinar_id: webinar._id,
+      offset_type: { $ne: "custom" },
+      $or: [{ dispatch_status: "pending" }, { whatsapp_dispatch_status: "pending" }],
+    });
+    for (const reminder of pendingReminders) {
+      reminder.computed_send_at = computeSendAt(
+        newStartsAt,
+        reminder.offset_type,
+        reminder.offset_value
+      );
+      await reminder.save();
+      // Re-arm the delayed job to the new time — without this, a stale
+      // BullMQ job would still fire at the old computed_send_at.
+      await scheduleReminderJob(reminder);
     }
 
-    if (startsAtChanged) {
-      // Never touch reminders that already fired/are firing, and never
-      // reinterpret an intentionally-fixed custom absolute date. $or on both
-      // dispatch fields — an email-only query here used to silently skip
-      // rescheduling whatsapp-only reminders when a webinar's start moved.
-      const pendingReminders = await WebinarReminder.find({
-        webinar_id: webinar._id,
-        offset_type: { $ne: "custom" },
-        $or: [{ dispatch_status: "pending" }, { whatsapp_dispatch_status: "pending" }],
-      });
-      for (const reminder of pendingReminders) {
-        reminder.computed_send_at = computeSendAt(
-          newStartsAt,
-          reminder.offset_type,
-          reminder.offset_value
+    // Let already-registered attendees know the time moved. Only for a
+    // still-upcoming webinar — a cancelled one gets its own notice
+    // instead (see the PUT /api/webinars/:id route), and a completed one
+    // has nobody left to tell.
+    if (webinar.status === "upcoming") {
+      const tag = webinarTag(webinar);
+      const subscribers = await EmailSubscriber.find({
+        tags: tag,
+        whatsapp_number: { $exists: true, $ne: null },
+        whatsapp_opted_out: { $ne: true },
+      }).lean();
+      for (const sub of subscribers) {
+        if (!sub.whatsapp_number) continue;
+        await sendLifecycleWhatsapp(
+          "webinar_rescheduled",
+          sub.whatsapp_number,
+          { firstName: sub.first_name || "there", webinarTitle: webinar.title, startsAt: newStartsAt, timezone: webinar.timezone },
+          // Keyed by the NEW start time: a second genuine reschedule sends
+          // its own notice, but re-running sync (or a racing concurrent
+          // sync) for the same reschedule never re-sends this one.
+          { webinarId: webinar._id, recipientEmail: sub.email, key: `webinar_rescheduled:${newStartsAt.toISOString()}` }
         );
-        await reminder.save();
-        // Re-arm the delayed job to the new time — without this, a stale
-        // BullMQ job would still fire at the old computed_send_at.
-        await scheduleReminderJob(reminder);
-      }
-
-      // Let already-registered attendees know the time moved. Only for a
-      // still-upcoming webinar — a cancelled one gets its own notice
-      // instead (see the PUT /api/webinars/:id route), and a completed one
-      // has nobody left to tell.
-      if (webinar.status === "upcoming") {
-        const tag = webinarTag(webinar);
-        const subscribers = await EmailSubscriber.find({
-          tags: tag,
-          whatsapp_number: { $exists: true, $ne: null },
-          whatsapp_opted_out: { $ne: true },
-        }).lean();
-        for (const sub of subscribers) {
-          if (!sub.whatsapp_number) continue;
-          await sendLifecycleWhatsapp(
-            "webinar_rescheduled",
-            sub.whatsapp_number,
-            { firstName: sub.first_name || "there", webinarTitle: webinar.title, startsAt: newStartsAt, timezone: webinar.timezone },
-            // Keyed by the NEW start time: a second genuine reschedule sends
-            // its own notice, but re-running sync (or a racing concurrent
-            // sync) for the same reschedule never re-sends this one.
-            { webinarId: webinar._id, recipientEmail: sub.email, key: `webinar_rescheduled:${newStartsAt.toISOString()}` }
-          );
-        }
       }
     }
+  }
+
+  // A window whose date was moved back into the future after it had already
+  // been marked completed (a reused window, or a date typo fixed late) used
+  // to stay "completed" forever: starts_at updated above, but nothing ever
+  // flipped the status back — so it vanished from the Upcoming list and
+  // handleDispatch silently skipped every one of its reminders. Done after
+  // the reschedule notice on purpose: that notice has always been for
+  // webinars that were still upcoming, not for re-opened past runs.
+  if (webinar.status === "completed" && webinar.starts_at.getTime() > Date.now()) {
+    webinar.status = "upcoming";
+    await webinar.save();
   }
 }
 
@@ -223,7 +276,7 @@ export async function syncRegistrantsForWebinar(webinar: any, force = false): Pr
 
   const res = await fetch(
     `${config.mainWebsite.url}/api/integrations/webinars/${webinar.source_window_id}/registrants`,
-    { headers: { "x-api-key": config.mainWebsite.apiKey } }
+    { headers: { "x-api-key": config.mainWebsite.apiKey }, signal: AbortSignal.timeout(WEBSITE_FETCH_TIMEOUT_MS) }
   );
   if (!res.ok) {
     console.error("syncRegistrantsForWebinar: fetch failed", webinar.source_window_id, res.status);
