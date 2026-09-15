@@ -348,11 +348,19 @@ router.post("/import", async (req: AuthenticatedRequest, res: Response) => {
     const ops = [];
 
     for (const sub of subscribers) {
-      if (!sub.email || !emailRegex.test(sub.email)) {
+      const rawEmail = (sub.email || "").toString().trim();
+      const email = rawEmail && emailRegex.test(rawEmail) ? rawEmail.toLowerCase() : "";
+
+      const whatsapp_number = (sub.whatsapp_number || sub.whatsappNumber || sub.phone_number || sub.phone || "")
+        .toString()
+        .replace(/[^\d+]/g, "")
+        .trim();
+
+      // A row needs at least one identifier to upsert against.
+      if (!email && !whatsapp_number) {
         continue;
       }
 
-      const email = sub.email.toLowerCase().trim();
       const first_name = sub.first_name || sub.firstName || "";
       const last_name = sub.last_name || sub.lastName || "";
 
@@ -362,15 +370,21 @@ router.post("/import", async (req: AuthenticatedRequest, res: Response) => {
       const combinedLists = Array.from(new Set([...rowLists, ...defaultLists])).filter(Boolean);
       const combinedTags = Array.from(new Set([...rowTags, ...defaultTags])).filter(Boolean);
 
+      // Merge semantics: a duplicate email/whatsapp match (within this CSV,
+      // or against an existing subscriber) has its non-empty fields override
+      // the stored ones (latest import wins), but an empty cell here must
+      // never blank out data a previous import already captured.
+      const setFields: Record<string, any> = { status: "subscribed" };
+      if (email) setFields.email = email;
+      if (whatsapp_number) setFields.whatsapp_number = whatsapp_number;
+      if (first_name) setFields.first_name = first_name;
+      if (last_name) setFields.last_name = last_name;
+
       ops.push({
         updateOne: {
-          filter: { email },
+          filter: email ? { email } : { whatsapp_number },
           update: {
-            $set: {
-              first_name,
-              last_name,
-              status: "subscribed",
-            },
+            $set: setFields,
             $addToSet: {
               lists: { $each: combinedLists },
               tags: { $each: combinedTags },

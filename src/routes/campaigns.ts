@@ -685,9 +685,34 @@ router.post("/:id/test-send-whatsapp", async (req: AuthenticatedRequest, res: Re
       return res.status(400).json({ error: "This campaign has no WhatsApp template configured" });
     }
 
+    // Which branch to use must be decided by what KIND of template this is
+    // (hardcoded/"supported" vs. a custom MSG91-approved one), not by whether
+    // whatsapp_variables happens to be non-empty — a custom template saved
+    // without its required variables filled in (e.g. a draft, which skips
+    // launch-time validation) would otherwise fall through to
+    // buildWhatsappTemplateParams(), which has no case for an unknown
+    // template name and silently returns 0 params. MSG91 then rejects the
+    // send ("localizable_params (0) does not match the expected number of
+    // params (N)") with no useful error surfaced here.
+    const templates = await getMergedWhatsappTemplates();
+    const match = templates.find((t) => t.name === campaign.whatsapp_template);
+    const isBuiltIn = match?.supported ?? true;
+
     let bodyParams: string[];
     let buttonUrlSuffix: string | undefined;
-    if (campaign.whatsapp_variables?.length || campaign.whatsapp_button_param) {
+    if (!isBuiltIn) {
+      const requiredBodyVars = match?.remote?.bodyVariableCount ?? 1;
+      const savedVariables = campaign.whatsapp_variables || [];
+      if (savedVariables.filter((v: string) => v?.trim()).length < requiredBodyVars) {
+        return res.status(400).json({
+          error: `"${campaign.whatsapp_template}" needs ${requiredBodyVars} variable value${requiredBodyVars === 1 ? "" : "s"} — edit the campaign and fill them in before testing`,
+        });
+      }
+      if (match?.remote?.buttons?.some((b) => b.needsParam) && !campaign.whatsapp_button_param?.trim()) {
+        return res.status(400).json({
+          error: `"${campaign.whatsapp_template}"'s button link needs a value — edit the campaign and fill it in before testing`,
+        });
+      }
       // Merge tags (e.g. {{first_name}}) an admin typed into a custom
       // template's variables need something to resolve against — there's no
       // real subscriber for a test send, so a synthetic one stands in.
@@ -698,7 +723,7 @@ router.post("/:id/test-send-whatsapp", async (req: AuthenticatedRequest, res: Re
         whatsapp_number: to,
         metadata: new Map(),
       } as any;
-      bodyParams = (campaign.whatsapp_variables || []).map((v: string) => replaceMergeTags(v, testSubscriber));
+      bodyParams = savedVariables.map((v: string) => replaceMergeTags(v, testSubscriber));
       buttonUrlSuffix = campaign.whatsapp_button_param
         ? replaceMergeTags(campaign.whatsapp_button_param, testSubscriber)
         : undefined;

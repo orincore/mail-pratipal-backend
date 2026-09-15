@@ -17,6 +17,7 @@ import { webinarTag } from "./webinar-sync";
 import { config } from "../config";
 import { sendWhatsappTemplate } from "../providers/msg91-whatsapp.provider";
 import { buildWhatsappTemplateParams, type WhatsappTemplateName } from "./whatsapp-templates";
+import { getMergedWhatsappTemplates } from "./whatsapp-template-sync";
 
 const BATCH_LIMIT = 50;
 
@@ -389,6 +390,37 @@ async function sendWhatsappLegForCampaign(campaign: any) {
   let sentInBatch = 0;
   let failedInBatch = 0;
 
+  // Which branch to use below must be decided by what KIND of template this
+  // is (hardcoded/"supported" vs. a custom MSG91-approved one), not by
+  // whether whatsapp_variables happens to be non-empty — a custom template
+  // whose required variables never got filled in (e.g. a "scheduled"/"paused"
+  // campaign had its template swapped via PUT, which doesn't re-run launch
+  // validation) would otherwise fall through to buildWhatsappTemplateParams(),
+  // which has no case for an unknown template name and silently returns 0
+  // params. MSG91 then rejects every send in the batch ("localizable_params
+  // (0) does not match the expected number of params (N)").
+  const templates = await getMergedWhatsappTemplates();
+  const match = templates.find((t) => t.name === claimed.whatsapp_template);
+  const isBuiltIn = match?.supported ?? true;
+  const requiredBodyVars = match?.remote?.bodyVariableCount ?? 1;
+  const filledVarsCount = (claimed.whatsapp_variables || []).filter((v: string) => v?.trim()).length;
+  const missingButtonParam = !!match?.remote?.buttons?.some((b) => b.needsParam) && !claimed.whatsapp_button_param?.trim();
+
+  if (!isBuiltIn && (filledVarsCount < requiredBodyVars || missingButtonParam)) {
+    for (const sub of batch) {
+      failedInBatch++;
+      await EmailEvent.create({
+        campaign_id: claimed._id,
+        recipient_email: sub.email.toLowerCase(),
+        channel: "whatsapp",
+        event_type: "failed",
+        timestamp: new Date(),
+        details: { error: `Template "${claimed.whatsapp_template}" is missing required variables/button param — edit the campaign before sending` },
+      });
+    }
+    return { status: "sent", sentInBatch, failedInBatch, remaining: Math.max(0, pendingSubscribers.length - batch.length) };
+  }
+
   for (const sub of batch) {
     if (!sub.whatsapp_number) {
       failedInBatch++;
@@ -414,7 +446,7 @@ async function sendWhatsappLegForCampaign(campaign: any) {
       // personalized per recipient.
       let bodyParams: string[];
       let buttonUrlSuffix: string | undefined;
-      if (claimed.whatsapp_variables?.length || claimed.whatsapp_button_param) {
+      if (!isBuiltIn) {
         bodyParams = (claimed.whatsapp_variables || []).map((v: string) => replaceMergeTags(v, sub));
         buttonUrlSuffix = claimed.whatsapp_button_param ? replaceMergeTags(claimed.whatsapp_button_param, sub) : undefined;
       } else {
