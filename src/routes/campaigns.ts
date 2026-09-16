@@ -329,9 +329,14 @@ router.put("/", async (req: AuthenticatedRequest, res: Response) => {
       return res.json({ success: true, campaign });
     }
 
-    // Field editing is only allowed before any sending has happened.
-    if (!["draft", "scheduled", "paused"].includes(campaign.status)) {
-      return res.status(400).json({ error: "Only draft, scheduled or paused campaigns can be edited" });
+    // "sent" is included so a misconfigured campaign (e.g. a custom WhatsApp
+    // template whose variables were never filled in, which fails every send)
+    // can be corrected afterward — editing here only updates the stored
+    // config, it never re-triggers a send, so it's safe on a completed
+    // campaign. That's what makes a subsequent Rerun (which clones this
+    // config) actually succeed instead of reproducing the same failure.
+    if (!["draft", "scheduled", "paused", "sent"].includes(campaign.status)) {
+      return res.status(400).json({ error: "This campaign cannot be edited in its current status" });
     }
 
     const editable: any = {};
@@ -364,6 +369,32 @@ router.put("/", async (req: AuthenticatedRequest, res: Response) => {
     if (editable.channel) {
       editable.dispatch_status = editable.channel === "whatsapp" ? "skipped" : "pending";
       editable.whatsapp_dispatch_status = editable.channel === "email" ? "skipped" : "pending";
+    }
+
+    // A "scheduled"/"paused" campaign is already armed to fire on its own —
+    // unlike a draft, there's no later "launch" step that would catch a
+    // custom template's variables/button param being edited into an invalid
+    // state. Validate here too, or the edit saves fine and the campaign
+    // fails silently at send time instead (every recipient rejected by
+    // MSG91 with "localizable_params (0) does not match the expected number
+    // of params (N)").
+    if (campaign.status !== "draft") {
+      const resultingChannel = editable.channel ?? campaign.channel;
+      const resultingTemplate = editable.whatsapp_template ?? campaign.whatsapp_template;
+      const touchesWhatsappConfig =
+        "whatsapp_template" in updateFields || "whatsapp_variables" in updateFields || "whatsapp_button_param" in updateFields || "channel" in updateFields;
+      if (touchesWhatsappConfig && resultingChannel !== "email" && resultingTemplate) {
+        const templates = await getMergedWhatsappTemplates();
+        const match = templates.find((t) => t.name === resultingTemplate);
+        const customTemplateError = validateCustomWhatsappTemplate(
+          match,
+          editable.whatsapp_variables ?? campaign.whatsapp_variables ?? [],
+          editable.whatsapp_button_param ?? campaign.whatsapp_button_param
+        );
+        if (customTemplateError) {
+          return res.status(400).json({ error: customTemplateError });
+        }
+      }
     }
 
     const updatedCampaign = await EmailCampaign.findByIdAndUpdate(id, editable, { new: true });
@@ -629,6 +660,25 @@ router.post("/:id/rerun", async (req: AuthenticatedRequest, res: Response) => {
     const campaign = await EmailCampaign.findById(id);
     if (!campaign) {
       return res.status(404).json({ error: "Campaign not found" });
+    }
+
+    // Rerun clones straight into "sending"/"scheduled" — unlike POST / there's
+    // no draft state to defer this to, so a broken config (e.g. a custom
+    // template whose required variables were never filled in) must be caught
+    // here or it silently reproduces the same failure on every rerun, with
+    // MSG91 rejecting every single send ("localizable_params (0) does not
+    // match the expected number of params (N)") and no useful error anywhere.
+    if (campaign.channel !== "email" && campaign.whatsapp_template) {
+      const templates = await getMergedWhatsappTemplates();
+      const match = templates.find((t) => t.name === campaign.whatsapp_template);
+      const customTemplateError = validateCustomWhatsappTemplate(
+        match,
+        campaign.whatsapp_variables || [],
+        campaign.whatsapp_button_param
+      );
+      if (customTemplateError) {
+        return res.status(400).json({ error: `${customTemplateError} — edit the original campaign first` });
+      }
     }
 
     const scheduledDate = schedule_type === "scheduled" && scheduled_at

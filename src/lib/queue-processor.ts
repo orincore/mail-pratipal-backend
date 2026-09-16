@@ -418,7 +418,19 @@ async function sendWhatsappLegForCampaign(campaign: any) {
         details: { error: `Template "${claimed.whatsapp_template}" is missing required variables/button param — edit the campaign before sending` },
       });
     }
-    return { status: "sent", sentInBatch, failedInBatch, remaining: Math.max(0, pendingSubscribers.length - batch.length) };
+    // Same batching contract as the normal send path below: only mark this
+    // leg fully done once every pending subscriber has actually gotten an
+    // event, not just the first batch — otherwise the remainder are silently
+    // dropped with no record at all once whatsapp_dispatch_status hits "sent".
+    claimed.stats.whatsapp_failed += failedInBatch;
+    claimed.whatsapp_dispatch_status = pendingSubscribers.length <= BATCH_LIMIT ? "sent" : "sending";
+    await claimed.save();
+    return {
+      status: claimed.whatsapp_dispatch_status,
+      sentCount: sentInBatch,
+      failedCount: failedInBatch,
+      remaining: Math.max(0, pendingSubscribers.length - BATCH_LIMIT),
+    };
   }
 
   for (const sub of batch) {
