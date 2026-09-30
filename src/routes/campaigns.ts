@@ -12,6 +12,7 @@ import { sendWhatsappTemplate } from "../providers/msg91-whatsapp.provider";
 import { getMergedWhatsappTemplates } from "../lib/whatsapp-template-sync";
 import { config } from "../config";
 import {
+import { parseScheduledAt } from "../lib/schedule-time";
   DEFAULT_WHATSAPP_TEMPLATE_FOR_PRESET,
   buildWhatsappTemplateParams,
   type WhatsappTemplateName,
@@ -217,7 +218,7 @@ router.post("/", async (req: AuthenticatedRequest, res: Response) => {
       return res.status(400).json({ error: "A/B test needs a variant B subject and/or template" });
     }
 
-    const scheduledDate = schedule_type === "scheduled" && scheduled_at ? new Date(scheduled_at) : new Date();
+    const scheduledDate = schedule_type === "scheduled" && scheduled_at ? parseScheduledAt(scheduled_at) : new Date();
 
     const campaign = await EmailCampaign.create({
       name,
@@ -320,7 +321,7 @@ router.put("/", async (req: AuthenticatedRequest, res: Response) => {
       const { schedule_type, scheduled_at } = req.body;
       if (schedule_type) campaign.schedule_type = schedule_type;
       if (campaign.schedule_type === "scheduled" && scheduled_at) {
-        campaign.scheduled_at = new Date(scheduled_at);
+        campaign.scheduled_at = parseScheduledAt(scheduled_at);
       } else {
         campaign.scheduled_at = new Date();
       }
@@ -363,7 +364,7 @@ router.put("/", async (req: AuthenticatedRequest, res: Response) => {
     }
     if ("audience" in updateFields) editable.audience = sanitizeAudience(updateFields.audience);
     if ("ab_test" in updateFields) editable.ab_test = sanitizeAbTest(updateFields.ab_test);
-    if (editable.scheduled_at) editable.scheduled_at = new Date(editable.scheduled_at);
+    if (editable.scheduled_at) editable.scheduled_at = parseScheduledAt(editable.scheduled_at);
 
     // Keep the per-channel dispatch legs consistent if the channel changed.
     if (editable.channel) {
@@ -682,7 +683,7 @@ router.post("/:id/rerun", async (req: AuthenticatedRequest, res: Response) => {
     }
 
     const scheduledDate = schedule_type === "scheduled" && scheduled_at
-      ? new Date(scheduled_at)
+      ? parseScheduledAt(scheduled_at)
       : new Date();
 
     // Create a duplicated campaign
