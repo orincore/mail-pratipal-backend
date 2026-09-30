@@ -22,6 +22,23 @@ import { getMergedWhatsappTemplates } from "./whatsapp-template-sync";
 const BATCH_LIMIT = 50;
 
 /**
+ * True for a MongoDB unique-index violation. The "already sent?" checks in
+ * both leg functions below (a distinct-recipients query run before the
+ * batch) are check-then-act — a concurrent sweep (the cron-driven
+ * /api/jobs/process hit and the standalone worker.ts, or two cluster
+ * instances of the same worker) can both see a recipient as pending and
+ * both dispatch to them before either records a "sent" EmailEvent. The
+ * unique partial index on (campaign_id, recipient_email, channel) for
+ * event_type "sent" (see models/EmailEvent.ts) then lets only one of those
+ * inserts through — the loser must NOT treat that as a send failure, since
+ * the send itself already succeeded and a "sent" row for this recipient
+ * already exists (written by whichever sweep won the race).
+ */
+function isDuplicateKeyError(err: any): boolean {
+  return err?.code === 11000 || err?.codeName === "DuplicateKey";
+}
+
+/**
  * Executes a full queue processing sweep. Webinar reminders no longer go
  * through this sweep — they're dispatched via BullMQ delayed jobs (see
  * src/lib/queue/) for exact-time firing and rate-limited fan-out. This sweep
@@ -305,14 +322,20 @@ async function sendEmailLegForCampaign(campaign: any, provider: any, trackingUrl
         headers: buildListUnsubscribeHeaders(trackingUrl, sub.email, source),
       });
 
-      await EmailEvent.create({
-        campaign_id: claimed._id,
-        recipient_email: sub.email.toLowerCase(),
-        channel: "email",
-        event_type: "sent",
-        timestamp: new Date(),
-        details: abEnabled ? { messageId, variant } : { messageId },
-      });
+      try {
+        await EmailEvent.create({
+          campaign_id: claimed._id,
+          recipient_email: sub.email.toLowerCase(),
+          channel: "email",
+          event_type: "sent",
+          timestamp: new Date(),
+          details: abEnabled ? { messageId, variant } : { messageId },
+        });
+      } catch (recordErr: any) {
+        if (!isDuplicateKeyError(recordErr)) throw recordErr;
+        console.warn(`Campaign ${claimed._id}: ${sub.email} was already recorded as sent (email) by a concurrent sweep — skipping`);
+        continue;
+      }
 
       sentInBatch++;
     } catch (err: any) {
@@ -480,14 +503,20 @@ async function sendWhatsappLegForCampaign(campaign: any) {
         buttonUrlSuffix,
       });
 
-      await EmailEvent.create({
-        campaign_id: claimed._id,
-        recipient_email: sub.email.toLowerCase(),
-        channel: "whatsapp",
-        event_type: "sent",
-        timestamp: new Date(),
-        details: { messageId: result.messageId },
-      });
+      try {
+        await EmailEvent.create({
+          campaign_id: claimed._id,
+          recipient_email: sub.email.toLowerCase(),
+          channel: "whatsapp",
+          event_type: "sent",
+          timestamp: new Date(),
+          details: { messageId: result.messageId },
+        });
+      } catch (recordErr: any) {
+        if (!isDuplicateKeyError(recordErr)) throw recordErr;
+        console.warn(`Campaign ${claimed._id}: ${sub.email} was already recorded as sent (whatsapp) by a concurrent sweep — skipping`);
+        continue;
+      }
 
       sentInBatch++;
     } catch (err: any) {

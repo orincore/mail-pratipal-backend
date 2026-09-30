@@ -10,9 +10,10 @@ import "../models/Webinar"; // Ensure webinar model is registered for populate
 import { prepareEmailHtml, replaceMergeTags } from "../lib/tracking-parser";
 import { sendWhatsappTemplate } from "../providers/msg91-whatsapp.provider";
 import { getMergedWhatsappTemplates } from "../lib/whatsapp-template-sync";
+import { reconcileWhatsappCampaignStats, getWhatsappMessageStatusMap } from "../lib/whatsapp-campaign-reconcile";
 import { config } from "../config";
-import {
 import { parseScheduledAt } from "../lib/schedule-time";
+import {
   DEFAULT_WHATSAPP_TEMPLATE_FOR_PRESET,
   buildWhatsappTemplateParams,
   type WhatsappTemplateName,
@@ -527,6 +528,44 @@ router.get("/:id/analytics", async (req: AuthenticatedRequest, res: Response) =>
         .sort((a: any, b: any) => a.variant.localeCompare(b.variant));
     }
 
+    // WhatsApp campaigns never populate the email stat fields (sent/opens/
+    // clicks/etc are meaningless for that channel) — our own whatsapp_sent/
+    // whatsapp_failed counters on campaign.stats are also just a
+    // best-effort tally from the batch send loop and can drift from what
+    // actually happened. MSG91's own delivery report is the source of truth
+    // for what really got delivered/read/held/failed, so reconcile against
+    // it directly from the messageIds we recorded at send time.
+    let whatsapp: Awaited<ReturnType<typeof reconcileWhatsappCampaignStats>> = null;
+    if (campaign.channel !== "email" && campaign.whatsapp_template) {
+      const [sentEvents, failedEvents] = await Promise.all([
+        EmailEvent.find({ ...baseMatch, channel: "whatsapp", event_type: "sent" }, { recipient_email: 1, "details.messageId": 1 }).lean(),
+        EmailEvent.find({ ...baseMatch, channel: "whatsapp", event_type: "failed" }, { recipient_email: 1, "details.error": 1 })
+          .sort({ timestamp: 1 })
+          .lean(),
+      ]);
+      const sentMessageIds = sentEvents.map((e: any) => e.details?.messageId).filter(Boolean);
+      // A recipient can have several "failed" rows (retried across sweeps)
+      // and/or a "failed" row from an earlier attempt followed by a later
+      // "sent" once it went through — "failed" has no unique index the way
+      // "sent" does, so naively counting every row double-counts recipients
+      // and inflates the total. Collapse to one entry per recipient who
+      // never actually got a "sent" event, keeping their most recent error.
+      const sentRecipients = new Set(sentEvents.map((e: any) => e.recipient_email));
+      const failedOnlyByRecipient = new Map<string, string>();
+      for (const fe of failedEvents as any[]) {
+        if (sentRecipients.has(fe.recipient_email)) continue;
+        failedOnlyByRecipient.set(fe.recipient_email, fe.details?.error || "Unknown error");
+      }
+      const sendFailedDetails = Array.from(failedOnlyByRecipient.values());
+      const aroundDate = campaign.sent_at || campaign.scheduled_at || (campaign as any).created_at || new Date();
+      whatsapp = await reconcileWhatsappCampaignStats(
+        campaign.whatsapp_template,
+        aroundDate,
+        sentMessageIds,
+        sendFailedDetails
+      );
+    }
+
     return res.json({
       campaign,
       totals: {
@@ -534,6 +573,7 @@ router.get("/:id/analytics", async (req: AuthenticatedRequest, res: Response) =>
         uniqueOpens,
         uniqueClicks,
       },
+      whatsapp,
       timeline: Array.from(timelineMap.values()),
       devices: devices.map((d: any) => ({ device: d._id, count: d.count })),
       browsers: browsers.map((b: any) => ({ browser: b._id, count: b.count })),
@@ -567,9 +607,43 @@ router.get("/:id/events", async (req: AuthenticatedRequest, res: Response) => {
     const events = await EmailEvent.find(query)
       .sort({ timestamp: -1 })
       .skip((page - 1) * limit)
-      .limit(limit);
+      .limit(limit)
+      .lean();
 
-    return res.json({ events, total, page, pages: Math.max(1, Math.ceil(total / limit)) });
+    // A WhatsApp "sent" row only ever meant our own call to MSG91's send API
+    // succeeded — the real delivered/read/held-by-Meta/failed outcome lives
+    // in MSG91's own delivery report, which routes/whatsapp.ts's webhook
+    // discards entirely (see its POST /webhook). Look up each row's real
+    // status from MSG91 directly rather than showing "sent" for everything.
+    const whatsappSentIds = events
+      .filter((e: any) => e.channel === "whatsapp" && e.event_type === "sent" && e.details?.messageId)
+      .map((e: any) => e.details.messageId as string);
+
+    let statusMap: Awaited<ReturnType<typeof getWhatsappMessageStatusMap>> = null;
+    if (whatsappSentIds.length > 0) {
+      const campaign: any = await EmailCampaign.findById(id, {
+        whatsapp_template: 1,
+        sent_at: 1,
+        scheduled_at: 1,
+        created_at: 1,
+      }).lean();
+      if (campaign?.whatsapp_template) {
+        const aroundDate = campaign.sent_at || campaign.scheduled_at || campaign.created_at || new Date();
+        statusMap = await getWhatsappMessageStatusMap(campaign.whatsapp_template, aroundDate, whatsappSentIds);
+      }
+    }
+
+    const enrichedEvents = events.map((e: any) => {
+      if (statusMap && e.channel === "whatsapp" && e.event_type === "sent" && e.details?.messageId) {
+        const match = statusMap.get(e.details.messageId);
+        if (match) {
+          return { ...e, whatsapp_status: match.status, whatsapp_failure_reason: match.failureReason };
+        }
+      }
+      return e;
+    });
+
+    return res.json({ events: enrichedEvents, total, page, pages: Math.max(1, Math.ceil(total / limit)) });
   } catch (error: any) {
     console.error("GET campaign events error:", error);
     return res.status(500).json({ error: error.message });

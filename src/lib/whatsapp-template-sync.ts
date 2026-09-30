@@ -22,6 +22,16 @@ export interface WhatsappTemplateButton {
   url?: string;
   /** True when `url` has a {{n}} placeholder MSG91 expects a value for at send time. */
   needsParam: boolean;
+  /**
+   * The value submitted for this button's {{1}} when the template was
+   * approved (MSG91's `buttons[].example[0]`) — usually the same real value
+   * every send needs (e.g. this template's one static join link), since a
+   * business only ever resubmits a *different* example when the destination
+   * actually changes. Used as the admin UI's default for "Button Link
+   * Value" instead of leaving it blank on every new campaign — see
+   * selectWhatsappTemplate in campaigns/page.tsx.
+   */
+  example?: string;
 }
 
 export interface RemoteWhatsappTemplateContent {
@@ -56,6 +66,26 @@ function countBodyVariables(body: string): number {
   const ids = new Set<string>();
   for (const m of body.matchAll(/\{\{\s*(\d+)\s*\}\}/g)) ids.add(m[1]);
   return ids.size;
+}
+
+/**
+ * MSG91/Meta's button `example` is the FULL example URL submitted at
+ * template-approval time (e.g. "http://m.9m.io/wamsg91"), not just the
+ * {{1}} value — but sendWhatsappTemplate() only ever takes the dynamic
+ * suffix, since MSG91's send API fills it into the button's static base URL
+ * itself. Derive that suffix by stripping the template's own static prefix
+ * (the part of `url` before "{{") from the example, tolerating a scheme
+ * mismatch (seen live: the template's url is "https://..." but its example
+ * is "http://...").  Returns undefined if the example doesn't actually
+ * share that prefix — a guessed-wrong default is worse than none.
+ */
+function extractButtonParamExample(url: string, example: string): string | undefined {
+  const placeholderIndex = url.indexOf("{{");
+  if (placeholderIndex === -1) return undefined;
+  const stripScheme = (v: string) => v.replace(/^https?:\/\//i, "");
+  const prefix = stripScheme(url.slice(0, placeholderIndex));
+  const body = stripScheme(example);
+  return body.startsWith(prefix) ? body.slice(prefix.length) : undefined;
 }
 
 // Per https://docs.msg91.com/whatsapp/get-templates — a completely different
@@ -125,12 +155,17 @@ async function fetchRemoteTemplates(): Promise<RemoteTemplate[]> {
       const footerComp = components.find((c) => c?.type === "FOOTER");
       const buttonsComp = components.find((c) => c?.type === "BUTTONS");
       const buttons: WhatsappTemplateButton[] = Array.isArray(buttonsComp?.buttons)
-        ? buttonsComp.buttons.map((b: any) => ({
-            type: String(b?.type || "URL"),
-            text: String(b?.text || ""),
-            url: typeof b?.url === "string" ? b.url : undefined,
-            needsParam: typeof b?.url === "string" && /\{\{\s*\d+\s*\}\}/.test(b.url),
-          }))
+        ? buttonsComp.buttons.map((b: any) => {
+            const url = typeof b?.url === "string" ? b.url : undefined;
+            const rawExample = Array.isArray(b?.example) && typeof b.example[0] === "string" ? b.example[0] : undefined;
+            return {
+              type: String(b?.type || "URL"),
+              text: String(b?.text || ""),
+              url,
+              needsParam: typeof url === "string" && /\{\{\s*\d+\s*\}\}/.test(url),
+              example: url && rawExample ? extractButtonParamExample(url, rawExample) : undefined,
+            };
+          })
         : [];
 
       const bodyText = typeof bodyComp?.text === "string" ? bodyComp.text : undefined;

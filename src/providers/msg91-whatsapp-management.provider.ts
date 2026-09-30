@@ -175,12 +175,21 @@ export async function sendWhatsappSessionMessage(opts: SendWhatsappSessionMessag
   return raiseForStatus(res, "session message send");
 }
 
-export async function getWhatsappLogs(startDate: string, endDate: string): Promise<any> {
+/**
+ * `limit` defaults to MSG91's own page size (100) for the plain account-wide
+ * logs viewer. Campaign reconciliation (see whatsapp-campaign-reconcile.ts)
+ * passes a much higher value — MSG91 has no real cursor-based pagination on
+ * this endpoint (its `paginationToken` was verified against the live API to
+ * just restart from row 0 rather than advance), so a single request with a
+ * generous `limit` is the only reliable way to get every row for a day.
+ */
+export async function getWhatsappLogs(startDate: string, endDate: string, limit?: number): Promise<any> {
   const { authKey } = requireMsg91Config();
 
   const url = new URL(LOGS_URL);
   url.searchParams.set("startDate", startDate);
   url.searchParams.set("endDate", endDate);
+  if (limit) url.searchParams.set("limit", String(limit));
 
   const res = await fetch(url.toString(), {
     method: "GET",
