@@ -145,7 +145,9 @@ async function runWebinarListSync(): Promise<void> {
   }
   const { webinars } = (await res.json()) as { webinars: any[] };
 
+  const seenWindowIds: string[] = [];
   for (const w of webinars || []) {
+    if (w.id) seenWindowIds.push(String(w.id));
     if (!w.webinar_starts_at) continue;
     // One bad window (or a duplicate-key race with another process's sync)
     // must not stop every window after it from syncing.
@@ -155,6 +157,18 @@ async function runWebinarListSync(): Promise<void> {
       console.error("syncWebinarsFromWebsite: failed to sync window", w.id, err);
     }
   }
+
+  // A window deleted on the website (or whose landing page was unpublished)
+  // is simply absent from the list above. Without flagging it, the webinar
+  // stayed "upcoming" and its scheduled reminders — including the "webinar is
+  // live now" message at start time — still went out to registrants for a
+  // webinar that no longer exists. Only trusted when the fetch fully
+  // succeeded (a failed fetch returns earlier). Reversible: syncOneWebinar
+  // clears the flag if the window reappears.
+  await Webinar.updateMany(
+    { status: "upcoming", source_window_id: { $nin: seenWindowIds }, source_missing_at: { $exists: false } },
+    { $set: { source_missing_at: new Date() } }
+  );
 
   // Webinars whose window was deleted on the website (or whose page was
   // unpublished) never come back in the list above, so nothing else would
@@ -185,6 +199,7 @@ async function syncOneWebinar(w: any): Promise<void> {
         join_link: w.join_link || undefined,
         join_platform: w.join_platform || undefined,
       },
+      $unset: { source_missing_at: "" },
       $setOnInsert: { status: "upcoming" },
     },
     { upsert: true, new: true }

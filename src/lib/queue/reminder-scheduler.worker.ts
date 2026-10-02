@@ -11,12 +11,23 @@ interface DispatchJobData {
 }
 
 async function handleDispatch(reminderId: string): Promise<void> {
-  const reminder = await WebinarReminder.findById(reminderId);
+  let reminder = await WebinarReminder.findById(reminderId);
   // Deleted or paused since this job was scheduled — no-op.
   if (!reminder || reminder.status !== "active") return;
 
-  const webinar = await Webinar.findById(reminder.webinar_id);
+  let webinar = await Webinar.findById(reminder.webinar_id);
   if (!webinar) return;
+
+  // Re-verify against the website right before sending. The 1-minute
+  // background sync can lag or time out (it has, in production), and a
+  // webinar window deleted/rescheduled on the website in that gap used to
+  // still fire its "starting soon" / "live now" messages. A failed fetch is
+  // swallowed here (logged) — the periodic flag is then the only protection.
+  await syncWebinarsFromWebsite(true).catch((err) => console.error("Pre-dispatch webinar sync failed:", err));
+  webinar = (await Webinar.findById(reminder.webinar_id)) ?? webinar;
+  // The sync may have re-timed this reminder (webinar moved) — use the fresh copy.
+  reminder = (await WebinarReminder.findById(reminderId)) ?? reminder;
+  if (reminder.status !== "active") return;
 
   if (webinar.status === "cancelled") {
     const updates: Record<string, string> = {};
@@ -26,6 +37,19 @@ async function handleDispatch(reminderId: string): Promise<void> {
     return;
   }
   if (webinar.status !== "upcoming") return;
+
+  // The website no longer lists this window (deleted / page unpublished), or
+  // it's the synthetic whole-page entry (page:<slug>) whose "start time" is
+  // just the page's created_at, not a real scheduled webinar. Either way
+  // there is no webinar happening — never tell registrants it's starting/live.
+  if (webinar.source_missing_at || webinar.source_window_id.startsWith("page:")) return;
+
+  // Stale delayed job: the webinar was moved later (or this reminder re-timed)
+  // after the job was armed. Re-arm to the real time instead of sending early.
+  if (reminder.computed_send_at.getTime() > Date.now() + 60 * 1000) {
+    await scheduleReminderJob(reminder);
+    return;
+  }
 
   const dispatchingEmail = ["pending", "sending"].includes(reminder.dispatch_status);
   const dispatchingWhatsapp = ["pending", "sending"].includes(reminder.whatsapp_dispatch_status);

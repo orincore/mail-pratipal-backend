@@ -265,6 +265,9 @@ router.post("/:id/reminders", async (req: AuthenticatedRequest, res: Response) =
     if (!webinar) {
       return res.status(404).json({ error: "Webinar not found" });
     }
+    if (webinar.source_missing_at || webinar.source_window_id.startsWith("page:")) {
+      return res.status(400).json({ error: "Can't add reminders — this webinar no longer exists on the website (or has no scheduled date)" });
+    }
 
     const {
       preset,
@@ -709,6 +712,9 @@ router.post("/:id/reminders/:reminderId/send-now", async (req: AuthenticatedRequ
     }
     if (webinar.status !== "upcoming") {
       return res.status(400).json({ error: `Can't send — this webinar is ${webinar.status}, not upcoming` });
+    }
+    if (webinar.source_missing_at || webinar.source_window_id.startsWith("page:")) {
+      return res.status(400).json({ error: "Can't send — this webinar no longer exists on the website (or has no scheduled date), so there is nothing to notify registrants about" });
     }
 
     if (reminder.computed_send_at.getTime() > Date.now()) {
